@@ -3260,6 +3260,12 @@ fn windows_external_absolute_argument_needs_translation(
         return true;
     }
 
+    // Opt-in drive-root fallback (`root_fallback_path`): `/src` resolved to
+    // the system drive inside the shell, so a child must get that spelling.
+    if root_fallback_argument(normalized, env_vars) {
+        return true;
+    }
+
     false
 }
 
@@ -4239,6 +4245,9 @@ fn shell_path_to_windows_inner(path: &str, env_vars: &HashMap<String, String>) -
     }
 
     if let Some(root) = shell_root {
+        if let Some(mapped) = root_fallback_path(&normalized, &root, env_vars) {
+            return mapped;
+        }
         if let Some(mapped) = map_logical_path(&normalized, &root) {
             return mapped;
         }
@@ -4639,6 +4648,93 @@ fn map_logical_path(normalized: &str, root: &Path) -> Option<PathBuf> {
     Some(mapped)
 }
 
+/// Root components the shell tree always owns, fallback or not: the
+/// install-tree members (`windows_virtual_system_root_argument`) plus the
+/// namespaces the resolver maps before the root (`/dev`, `/tmp`, `/home`,
+/// `/mnt`, `/cygdrive`, `/proc`).
+const ROOT_FALLBACK_RESERVED: &[&str] = &[
+    "bin", "cygdrive", "dev", "etc", "home", "lib", "lib64", "mnt", "opt", "proc", "sbin", "tmp",
+    "usr", "var",
+];
+
+/// Whether the drive-root fallback is enabled: `RUBASH_ROOT_FALLBACK` or
+/// its niubash spelling `NIU_ROOT_FALLBACK` set to anything but empty,
+/// `0`, `false`, `no` or `off` (case-insensitive).
+fn root_fallback_enabled(env_vars: &HashMap<String, String>) -> bool {
+    ["RUBASH_ROOT_FALLBACK", "NIU_ROOT_FALLBACK"]
+        .into_iter()
+        .filter_map(|name| env_vars.get(name))
+        .any(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && !["0", "false", "no", "off"]
+                    .iter()
+                    .any(|off| value.eq_ignore_ascii_case(off))
+        })
+}
+
+/// The host system drive (`SystemDrive`, from the session env first, then
+/// the process env), normalized to `X:`; `C:` when neither is usable.
+fn root_fallback_system_drive(env_vars: &HashMap<String, String>) -> String {
+    let from_session = env_vars
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("SystemDrive"))
+        .map(|(_, value)| value.clone());
+    let value = from_session
+        .or_else(|| std::env::var("SystemDrive").ok())
+        .unwrap_or_default();
+    let bytes = value.trim().as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        format!("{}:", (bytes[0] as char).to_ascii_uppercase())
+    } else {
+        "C:".to_string()
+    }
+}
+
+/// Opt-in drive-root fallback for a configured shell root (nt fix): an
+/// absolute POSIX path whose FIRST component is missing below the shell
+/// root but exists at the system drive root resolves against the drive —
+/// `cd /src` reaches `C:\src` when `<root>\src` does not exist. The probe
+/// is per first component, so `mkdir /src/new` and `> /src/new.txt` reach
+/// the same directory as `cd /src`. Reserved shell-tree components
+/// ([`ROOT_FALLBACK_RESERVED`]), drive forms and the bare `/` never fall
+/// back; when neither side exists the root mapping (and its error) stays.
+fn root_fallback_path(
+    normalized: &str,
+    root: &Path,
+    env_vars: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    if !cfg!(windows) || !root_fallback_enabled(env_vars) {
+        return None;
+    }
+    let mapped = map_logical_path(normalized, root)?;
+    let relative = mapped.strip_prefix(root).ok()?;
+    let first = relative.components().next()?;
+    let first = first.as_os_str().to_str()?;
+    if ROOT_FALLBACK_RESERVED
+        .iter()
+        .any(|reserved| first.eq_ignore_ascii_case(reserved))
+    {
+        return None;
+    }
+    if root.join(first).exists() {
+        return None;
+    }
+    let drive_root = PathBuf::from(format!("{}\\", root_fallback_system_drive(env_vars)));
+    if !drive_root.join(first).exists() {
+        return None;
+    }
+    Some(drive_root.join(relative))
+}
+
+/// Whether an absolute operand resolves through [`root_fallback_path`];
+/// such operands translate for every child class, coreutils included,
+/// because a child's own shell-tree layer would map them below the root.
+fn root_fallback_argument(normalized: &str, env_vars: &HashMap<String, String>) -> bool {
+    configured_shell_root(env_vars)
+        .is_some_and(|root| root_fallback_path(normalized, &root, env_vars).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5023,6 +5119,105 @@ mod tests {
         assert_eq!(
             shell_path_to_windows("/etc/config", &env_vars),
             root.join("etc").join("config")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    fn root_fallback_env(root: &Path, fallback: Option<&str>) -> HashMap<String, String> {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "__RUBASH_SHELL_ROOT".to_string(),
+            root.to_string_lossy().to_string(),
+        );
+        env_vars.insert(
+            "SystemDrive".to_string(),
+            std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string()),
+        );
+        if let Some(value) = fallback {
+            env_vars.insert("NIU_ROOT_FALLBACK".to_string(), value.to_string());
+        }
+        env_vars
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_fallback_resolves_missing_root_children_on_system_drive() {
+        // `Windows` exists at every system drive root and never below a
+        // fresh shell root, so it stands in for `C:\src`.
+        let root = std::env::temp_dir().join("rubash-root-fallback");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let drive = root_fallback_system_drive(&root_fallback_env(&root, None));
+        let drive_root = PathBuf::from(format!("{drive}\\"));
+
+        let off = root_fallback_env(&root, None);
+        assert_eq!(
+            shell_path_to_windows("/Windows", &off),
+            root.join("Windows")
+        );
+        let zero = root_fallback_env(&root, Some("0"));
+        assert_eq!(
+            shell_path_to_windows("/Windows", &zero),
+            root.join("Windows")
+        );
+
+        let on = root_fallback_env(&root, Some("1"));
+        assert_eq!(
+            shell_path_to_windows("/Windows", &on),
+            drive_root.join("Windows")
+        );
+        assert_eq!(
+            shell_path_to_windows("/Windows/System32/new-file.txt", &on),
+            drive_root
+                .join("Windows")
+                .join("System32")
+                .join("new-file.txt")
+        );
+        assert_eq!(
+            shell_path_to_windows("/./Windows/../Windows/System32", &on),
+            drive_root.join("Windows").join("System32")
+        );
+        // The bare root, reserved shell-tree members and names missing on
+        // both sides keep the root mapping.
+        assert_eq!(
+            shell_path_to_windows("/", &on),
+            shell_path_to_windows("/", &off)
+        );
+        assert_eq!(
+            shell_path_to_windows("/etc/config", &on),
+            root.join("etc").join("config")
+        );
+        assert_eq!(
+            shell_path_to_windows("/rubash-root-fallback-missing-xyz", &on),
+            root.join("rubash-root-fallback-missing-xyz")
+        );
+        // A real child of the shell root wins over the drive.
+        fs::create_dir_all(root.join("Windows")).unwrap();
+        assert_eq!(shell_path_to_windows("/Windows", &on), root.join("Windows"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_fallback_operands_translate_for_children() {
+        let root = std::env::temp_dir().join("rubash-root-fallback-argv");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let on = root_fallback_env(&root, Some("yes"));
+        let drive = root_fallback_system_drive(&on);
+        assert!(root_fallback_argument("/Windows", &on));
+        assert!(!root_fallback_argument("/usr/bin", &on));
+        assert!(!root_fallback_argument("/", &on));
+        assert_eq!(
+            external_argument_path("/Windows/System32", &on),
+            format!("{drive}\\Windows\\System32")
+        );
+        let off = root_fallback_env(&root, None);
+        assert!(!root_fallback_argument("/Windows", &off));
+        assert_eq!(
+            external_argument_path("/Windows/System32", &off),
+            "/Windows/System32"
         );
         let _ = fs::remove_dir_all(&root);
     }
