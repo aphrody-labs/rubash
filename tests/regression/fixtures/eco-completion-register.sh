@@ -36,7 +36,8 @@ compgen -W "alpha beta gamma" -- 'a'
 echo "== compgen files"
 : >reg-a.one
 : >reg-b.two
-compgen -f -- 'reg-'
+# GNU compgen keeps readdir order (only readline's display sorts): sort for a host-independent golden.
+compgen -f -- 'reg-' | LC_ALL=C sort
 echo "== compgen -A directory"
 mkdir -p reg-dir
 compgen -A directory -- 'reg-'
