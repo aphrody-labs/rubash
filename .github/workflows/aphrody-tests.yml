@@ -3,7 +3,7 @@ name: aphrody tests
 # Suite complète de rubash pour la chaîne aphrody (monorepo src, docs/unixwin/LEARNINGS.md), sur le même socle
 # que la CI amont (sous-modules, binaire construit avant les tests, fixture bashdb, nextest profil ci avec
 # délais) : bibliothèque, puis tests/*.rs découpés en parts. Les exclusions sont celles de l'amont
-# (scripts/ci-pin-exclusions.txt). ulimit -n relevé, TMPDIR dans le workspace. prd n'exécute plus la suite.
+# (scripts/ci-pin-exclusions.txt). ulimit -n relevé, TMPDIR sur /mnt (disque du runner, hors $HOME). prd n'exécute plus la suite.
 on:
   push:
     branches: [master]
@@ -48,8 +48,10 @@ jobs:
         shell: bash
         run: |
           ulimit -n 65536
-          export TMPDIR="$GITHUB_WORKSPACE/target/tmp"
-          mkdir -p "$TMPDIR"
+          # TMPDIR sur disque mais hors de $HOME : sous ~/work, dirs/pushd abrègent les chemins en ~ et les
+          # tests de pile de répertoires (issue2391, 2424, 2937, 3196, 3335...) comparent des chemins absolus.
+          sudo install -d -o "$USER" /mnt/rubash-tmp
+          export TMPDIR=/mnt/rubash-tmp
           part='${{ matrix.part }}'
           if [ "$part" = lib ]; then
             exec cargo nextest run --lib --profile ci --no-fail-fast
