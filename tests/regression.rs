@@ -2462,9 +2462,14 @@ mod issue_759 {
             "`dirs -v` is numbered, one per line: {numbered:?}"
         );
         let long_numbered = run("cd a\npushd ../b >/dev/null\ndirs -l -v");
-        assert_eq!(
-            long_numbered, numbered,
-            "`dirs -l -v` renders like `dirs -v`"
+        // GNU bash 5.3 (Git for Windows 5.3.15, 2026-11-13): `dirs -l -v` keeps the numbered
+        // layout of `-v` but prints full paths, no `~` abbreviation.
+        assert_eq!(long_numbered.lines().count(), 2, "{long_numbered:?}");
+        assert!(!long_numbered.contains('~'), "{long_numbered:?}");
+        assert!(
+            long_numbered.lines().next().is_some_and(|l| l.starts_with(" 0  ") && l.ends_with("/b"))
+                && long_numbered.lines().nth(1).is_some_and(|l| l.starts_with(" 1  ") && l.ends_with("/a")),
+            "`dirs -l -v` is numbered like `dirs -v`: {long_numbered:?}"
         );
     }
 }
@@ -3863,11 +3868,20 @@ mod k1_batch2 {
     fn issue_1218_posix_time_dash_word() {
         let (stdout, stderr, code) = run("k1-1218", "set -o posix\ntime -p true\necho \"rc=$?\"\n");
         assert_eq!(code, Some(0), "stderr:\n{stderr}");
-        assert_eq!(stdout, "rc=127\n");
-        assert!(
-            stderr.contains("fg.sh: line 2: time: command not found"),
-            "stderr:\n{stderr}"
-        );
+        // The dispatch target is the external `time`: hosts that ship one (GNU time in
+        // /usr/bin on ubuntu-latest) run it, the others report 127.
+        let external_time = std::env::split_paths(&minimal_path())
+            .any(|dir| dir.join(if cfg!(windows) { "time.exe" } else { "time" }).is_file());
+        if external_time {
+            assert_eq!(stdout, "rc=0\n", "stderr:\n{stderr}");
+            assert!(!stderr.contains("time: command not found"), "stderr:\n{stderr}");
+        } else {
+            assert_eq!(stdout, "rc=127\n");
+            assert!(
+                stderr.contains("fg.sh: line 2: time: command not found"),
+                "stderr:\n{stderr}"
+            );
+        }
     }
 
     /// rubash#1222: `wait` for a disowned pid succeeds silently with
@@ -5966,7 +5980,10 @@ mod issue_1584 {
         let dir = case_scratch("1584-named");
         let (stdout, stderr, status) = run(
             &dir,
-            "coproc NC cat\n\
+            // GNU: a NAME is only taken before a compound command; `coproc NC cat` runs the
+            // command `NC` (bash 5.3.15: "NC: command not found"). `{ exec cat; }` keeps the
+            // program as the coproc process.
+            "coproc NC { exec cat; }\n\
              p=${NC_PID}\n\
              echo \"comm=$(ps -o comm= -p $p 2>/dev/null)\"\n\
              echo hello >&${NC[1]}\n\
