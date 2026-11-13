@@ -67,6 +67,11 @@ where
     } else {
         Mode::Logical
     };
+    // MSYS (Git for Windows bash): `pwd -W` prints the physical directory in
+    // its Windows form with forward slashes (C:/Users/me), whatever -L/-P say.
+    // Scripts written for Git Bash use `$(pwd -W)` to hand a native tool a
+    // drive path; Windows builds only, as in MSYS.
+    let mut windows_form = false;
 
     for arg in args {
         if arg == "--" {
@@ -81,6 +86,7 @@ where
             match option {
                 'L' => mode = Mode::Logical,
                 'P' => mode = Mode::Physical,
+                'W' if cfg!(windows) => windows_form = true,
                 other => {
                     // rubash#705 R7.4: GNU's get_name_for_error shape —
                     // `<script>: line N:` in script mode, the argv[0]
@@ -120,6 +126,11 @@ where
              getcwd: cannot access parent directories: No such file or directory"
         )?;
         return Ok(EXECUTION_FAILURE);
+    }
+
+    if windows_form {
+        writeln!(stdout, "{}", windows_display_path(cwd))?;
+        return Ok(EXECUTION_SUCCESS);
     }
 
     let Some(directory) = current_directory(mode, env_vars, cwd, logical_cwd, stderr)? else {
@@ -349,6 +360,18 @@ fn shell_display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// `pwd -W`: the session cwd in MSYS's mixed form, `C:/dir` — the
+/// extended-length prefix (`\\?\`, `\\?\UNC\`) removed, separators forward.
+fn windows_display_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let plain = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+    };
+    plain.replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +402,39 @@ mod tests {
         assert_eq!(status, EX_USAGE);
         assert!(stdout.is_empty());
         assert!(stderr.contains("invalid option"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msys_w_option_prints_windows_form_of_physical_cwd() {
+        // Git for Windows bash: `cd /tmp; pwd -W` -> C:/Users/me/AppData/Local/Temp.
+        let native = env::temp_dir();
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", native.to_string_lossy()));
+        for (cwd, args) in [(&native, &["-W"][..]), (&verbatim, &["-LW"][..]), (&native, &["-P", "-W"][..])] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let status = execute_with_env_and_io(
+                args.iter().copied(),
+                &HashMap::new(),
+                cwd,
+                Some("/tmp"),
+                &mut stdout,
+                &mut stderr,
+            )
+            .unwrap();
+            assert_eq!(status, EXECUTION_SUCCESS);
+            let printed = String::from_utf8(stdout).unwrap();
+            let want = native.to_string_lossy().trim_end_matches('\\').replace('\\', "/");
+            assert_eq!(printed.trim_end().trim_end_matches('/'), want, "{args:?}");
+            assert!(stderr.is_empty());
+        }
+        assert_eq!(windows_display_path(Path::new(r"\\?\UNC\srv\share\d")), "//srv/share/d");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn w_option_is_invalid_outside_windows() {
+        assert_eq!(run(&["-W"]).0, EX_USAGE);
     }
 
     #[cfg(windows)]
