@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [lib, pins-0, pins-1, pins-2, pins-3, pins-4, pins-5, other]
+        part: [lib, cargo, pins-0, pins-1, pins-2, pins-3, pins-4, pins-5, other]
     env:
       CARGO_TERM_COLOR: never
     steps:
@@ -54,9 +54,18 @@ jobs:
           export TMPDIR=/mnt/rubash-tmp
           part='${{ matrix.part }}'
           if [ "$part" = lib ]; then
-            exec cargo nextest run --lib --profile ci --no-fail-fast
+            # Bibliothèque par cargo test : sous nextest, issue2875 (enfant de procsub) relance le binaire de test
+            # (« Unrecognized option: c », rouge aussi en amont) ; sous cargo test le test passe (prd, 2026-11-13).
+            exec cargo test --locked --lib -- --test-threads=4
+          fi
+          mapfile -t cargo_only < <(grep -vE '^(#|$)' .config/aphrody-cargo-test.txt)
+          if [ "$part" = cargo ]; then
+            cargo_args=()
+            for stem in "${cargo_only[@]}"; do cargo_args+=(--test "$stem"); done
+            exec cargo test --locked --no-fail-fast "${cargo_args[@]}" -- --test-threads=4
           fi
           mapfile -t excluded < <(grep -vE '^(#|$)' scripts/ci-pin-exclusions.txt | cut -d' ' -f1)
+          excluded+=("${cargo_only[@]}")
           args=()
           i=0
           for f in tests/*.rs; do
@@ -73,4 +82,4 @@ jobs:
             args+=(--test "$stem")
           done
           echo "part $part : $(( ${#args[@]} / 2 )) cibles"
-          cargo nextest run --profile ci --no-fail-fast "${args[@]}"
+          cargo nextest run --profile aphrody --no-fail-fast "${args[@]}"

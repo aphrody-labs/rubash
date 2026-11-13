@@ -5,3 +5,10 @@
 slow-timeout = "30s"
 timeout-source = "profile"
 termination-timeout = "10s"
+
+# Chaîne aphrody (workflow « aphrody tests ») : même profil, mais un test bloqué est tué après 4 périodes
+# (2 min) au lieu de bloquer la part jusqu'au délai du job.
+[profile.aphrody]
+slow-timeout = { period = "30s", terminate-after = 4 }
+timeout-source = "profile"
+termination-timeout = "10s"
