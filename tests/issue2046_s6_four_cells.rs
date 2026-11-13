@@ -9,15 +9,10 @@
 
 use std::process::Command;
 
+// Cargo sets CARGO_BIN_EXE_<bin> for integration tests; the old current_exe()/../../rubash
+// walk broke under cargo's build-dir layout (target/debug/build/<pkg>/<hash>/out/<test>).
 fn rubash() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().expect("current exe");
-    path.pop();
-    path.pop();
-    path.push("rubash");
-    if cfg!(windows) {
-        path.set_extension("exe");
-    }
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_rubash"))
 }
 
 struct Output {
