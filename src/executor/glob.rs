@@ -577,6 +577,19 @@ fn dequote_pathname(pathname: &str) -> String {
     let mut chars = pathname.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
+            // Windows: a backslash that reaches the glob-free directory part
+            // is path data, never an escape. The lexer already resolved
+            // unquoted escapes (ordinary \x to x, pattern-significant ones to
+            // CTLESC pairs), so a raw backslash here comes from expanded
+            // text such as "$LOCALAPPDATA"/Programs/*.exe or "$TEMP"/*.log,
+            // where Git for Windows bash keeps it as the separator it is.
+            // A backslash before a glob metacharacter keeps the escape; a raw
+            // pair stays a pair (UNC \\server\share).
+            '\\' if cfg!(windows)
+                && !matches!(chars.peek(), None | Some('*' | '?' | '[' | ']')) =>
+            {
+                output.push('\\');
+            }
             '\\' => match chars.next() {
                 Some(next) => output.push(next),
                 None => output.push('\\'),
@@ -2624,6 +2637,42 @@ fn numeric_value(s: &str) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows: `"$LOCALAPPDATA"/Programs/*.exe` globs like Git for Windows
+    /// bash. The quoted expansion's backslashes are separators in the
+    /// glob-free directory part, and the matches keep that prefix.
+    #[cfg(windows)]
+    #[test]
+    fn windows_backslash_directory_prefix_globs() {
+        let root = std::env::temp_dir().join("rubash-glob-backslash-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for name in ["one.exe", "two.exe", "three.txt"] {
+            std::fs::write(root.join("sub").join(name), "x").unwrap();
+        }
+        let prefix = root.to_string_lossy().to_string();
+        assert!(prefix.contains('\\'), "{prefix}");
+        assert_eq!(dequote_pathname(&format!("{prefix}\\sub/")), format!("{prefix}\\sub/"));
+        // An escaped metacharacter keeps its escape; a UNC prefix stays intact.
+        assert_eq!(dequote_pathname("a\\*b"), "a*b");
+        assert_eq!(dequote_pathname(r"\\srv\share/"), r"\\srv\share/");
+        let env = std::collections::HashMap::new();
+        let mut got = glob_filename_expand(
+            &format!("{prefix}\\sub/*.exe"),
+            false,
+            false,
+            DotMode::Period,
+            true,
+            &env,
+            Path::new("/"),
+        );
+        got.sort();
+        assert_eq!(
+            got,
+            vec![format!("{prefix}\\sub/one.exe"), format!("{prefix}\\sub/two.exe")]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Contract for the #681 per-file staging removal: scratch-buffer reuse
     /// plus the zero-copy extglob alt subslice must preserve dotfile,
