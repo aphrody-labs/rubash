@@ -79,8 +79,9 @@ jobs:
             stem=$(basename "$f" .rs)
             case " ${excluded[*]} " in *" $stem "*) continue ;; esac
             case "$part" in
-              # other : les cibles non-issue que la CI amont exécute (cli_tests, marker_leak_golden, regression).
-              other) case $stem in cli_tests | marker_leak_golden | regression) ;; *) continue ;; esac ;;
+              # other : les cibles non-issue que la CI amont exécute par nextest (cli_tests, marker_leak_golden) ;
+              # regression passe par la part cargo, comme en amont.
+              other) case $stem in cli_tests | marker_leak_golden) ;; *) continue ;; esac ;;
               legacy)
                 [[ $stem == issue* ]] && continue
                 case $stem in cli_tests | marker_leak_golden | regression) continue ;; esac

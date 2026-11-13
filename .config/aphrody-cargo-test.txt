@@ -2,3 +2,6 @@
 # dans le workflow « aphrody tests » : en parallèle sous nextest, le pli de descripteurs de 2029 diverge
 # sur ubuntu-latest, alors que la série le passe (CI 2026-11-13).
 issue2029_fd_offset_fold_regressions
+# regression : la CI amont la lance par cargo test (job « GNU regression goldens »), TMPDIR par défaut ;
+# sous nextest avec TMPDIR sur /mnt, dirs -l (issue_759), coproc nommé (issue_1584) et les goldens divergent.
+regression
