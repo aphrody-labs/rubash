@@ -353,15 +353,19 @@ impl Executor {
         let mut env_vars = if process_exit {
             crate::shell::var_table::VarTable::from_values(
                 crate::executor::env_helpers::entry_encode_imported_env(
-                    crate::executor::env_helpers::process_env_pairs()
-                        .into_iter()
-                        .collect(),
+                    crate::executor::env_helpers::with_windows_env_aliases(
+                        crate::executor::env_helpers::process_env_pairs()
+                            .into_iter()
+                            .collect(),
+                    ),
                 ),
             )
         } else {
             crate::shell::var_table::VarTable::from_values(
                 crate::executor::env_helpers::entry_encode_imported_env(
-                    process_env_snapshot.clone(),
+                    crate::executor::env_helpers::with_windows_env_aliases(
+                        process_env_snapshot.clone(),
+                    ),
                 ),
             )
         };

@@ -68,6 +68,79 @@ pub(crate) fn entry_encode_imported_env_value(name: &str, value: &str) -> String
     }
 }
 
+/// Windows names that Git for Windows bash (Cygwin) exposes in upper case
+/// whatever the stored spelling (measured 2026-11-13 against bash 5.3.15
+/// of Git for Windows 2.56.0.windows.4: `SystemRoot` -> `SYSTEMROOT`,
+/// `windir` -> `WINDIR`, while `ProgramData`, `OneDrive`,
+/// `ProgramFiles(x86)` keep their case).
+pub(in crate::executor) const WINDOWS_UPPERCASE_ENV_ALIASES: &[&str] = &[
+    "COMMONPROGRAMFILES",
+    "COMSPEC",
+    "PROGRAMFILES",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "WINDIR",
+];
+
+/// Windows: scripts written for Git Bash read `$SYSTEMROOT`, `$WINDIR`,
+/// `$COMSPEC`... The Windows environment block is case-insensitive and
+/// keeps `SystemRoot`/`windir`, which the case-sensitive variable table
+/// imports verbatim, so those names were unbound. Add the upper-case
+/// spelling next to the stored one (both stay bound; a child's environment
+/// block is case-insensitive, so the pair is one variable there). An
+/// explicit upper-case entry always wins. No-op off Windows.
+pub(in crate::executor) fn with_windows_env_aliases(
+    mut values: HashMap<String, String>,
+) -> HashMap<String, String> {
+    if !cfg!(windows) {
+        return values;
+    }
+    for upper in WINDOWS_UPPERCASE_ENV_ALIASES {
+        if values.contains_key(*upper) {
+            continue;
+        }
+        let found = values
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(upper))
+            .map(|(_, value)| value.clone());
+        if let Some(value) = found {
+            values.insert((*upper).to_string(), value);
+        }
+    }
+    values
+}
+
+#[cfg(test)]
+mod windows_env_alias_tests {
+    use super::*;
+
+    #[test]
+    fn upper_case_aliases_follow_git_for_windows() {
+        let input: HashMap<String, String> = [
+            ("SystemRoot", r"C:\WINDOWS"),
+            ("windir", r"C:\WINDOWS"),
+            ("ComSpec", r"C:\WINDOWS\system32\cmd.exe"),
+            ("ProgramData", r"C:\ProgramData"),
+            ("PROGRAMFILES", "explicit"),
+            ("ProgramFiles", r"C:\Program Files"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let out = with_windows_env_aliases(input.clone());
+        if cfg!(windows) {
+            assert_eq!(out.get("SYSTEMROOT").map(String::as_str), Some(r"C:\WINDOWS"));
+            assert_eq!(out.get("WINDIR").map(String::as_str), Some(r"C:\WINDOWS"));
+            assert_eq!(out.get("COMSPEC").map(String::as_str), Some(r"C:\WINDOWS\system32\cmd.exe"));
+            assert_eq!(out.get("SystemRoot").map(String::as_str), Some(r"C:\WINDOWS"));
+            assert_eq!(out.get("PROGRAMFILES").map(String::as_str), Some("explicit"));
+            assert!(!out.contains_key("PROGRAMDATA"));
+        } else {
+            assert_eq!(out, input);
+        }
+    }
+}
+
 pub(in crate::executor) fn entry_encode_imported_env(
     values: HashMap<String, String>,
 ) -> HashMap<String, String> {
