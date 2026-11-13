@@ -3,3 +3,4 @@
 # pour les pins amont. Premier mot = nom exact du test, le reste = raison.
 golden_issue2908_ruby_build_exec install de ruby-build interrompu après le téléchargement (install-rc=1, stderr non vide) ; à diagnostiquer
 golden_nvm_load portail de temps nvm.sh : 5,1 s contre 1,5 s de budget (classe rubash#1940/#1961), régression de performance du lexer
+issue1584_named_coproc_pid_is_the_program `coproc NC { exec cat; }` : le processus du coproc reste rubash (comm=rubash, GNU 5.3.15 : cat) ; exec dans le fils d'un coproc composé n'est pas un vrai execve
