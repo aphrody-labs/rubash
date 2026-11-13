@@ -1,0 +1,54 @@
+name: aphrody tests
+
+# Suite complète de rubash pour la chaîne aphrody (monorepo src, docs/unixwin/LEARNINGS.md) : la crate unique
+# est découpée en lots (bibliothèque + tests/*.rs répartis en 8 parts), descripteurs relevés, TMPDIR dans le
+# workspace. prd n'exécute plus la suite complète.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: suite (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [lib, "0", "1", "2", "3", "4", "5", "6", "7"]
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1.11
+        with:
+          cache: true
+      - name: Run part
+        shell: bash
+        run: |
+          ulimit -n 65536
+          export TMPDIR="$GITHUB_WORKSPACE/.tmp"
+          mkdir -p "$TMPDIR"
+          if [ "${{ matrix.part }}" = lib ]; then
+            cargo test --locked --lib -- --test-threads=4
+            exit
+          fi
+          args=()
+          i=0
+          for f in tests/*.rs; do
+            if [ $((i % 8)) -eq ${{ matrix.part }} ]; then
+              args+=(--test "$(basename "$f" .rs)")
+            fi
+            i=$((i + 1))
+          done
+          echo "${#args[@]} arguments, part ${{ matrix.part }}"
+          cargo test --locked --no-fail-fast "${args[@]}" -- --test-threads=4 2>&1 | tee "$TMPDIR/part.log"
+          code=${PIPESTATUS[0]}
+          grep -E '^---- |^test result: FAILED' "$TMPDIR/part.log" | head -400 || true
+          exit "$code"
