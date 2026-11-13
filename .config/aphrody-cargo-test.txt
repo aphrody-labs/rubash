@@ -5,3 +5,4 @@ issue2029_fd_offset_fold_regressions
 issue2043_sync_a_class_regressions
 issue2046_s6_four_cells
 issue2046_sync_b_class_regressions
+issue2086_comsub_child_stderr_regressions

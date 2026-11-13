@@ -50,19 +50,23 @@ jobs:
           ulimit -n 65536
           # TMPDIR sur disque mais hors de $HOME : sous ~/work, dirs/pushd abrègent les chemins en ~ et les
           # tests de pile de répertoires (issue2391, 2424, 2937, 3196, 3335...) comparent des chemins absolus.
-          sudo install -d -o "$USER" /mnt/rubash-tmp
-          export TMPDIR=/mnt/rubash-tmp
           part='${{ matrix.part }}'
+          # lib et cargo : conditions de prd où ces cibles passent (TMPDIR par défaut, threads de
+          # .cargo/config.toml : RUST_TEST_THREADS=1) ; nextest : un processus par test, TMPDIR sur /mnt.
+          if [ "$part" != lib ] && [ "$part" != cargo ]; then
+            sudo install -d -o "$USER" /mnt/rubash-tmp
+            export TMPDIR=/mnt/rubash-tmp
+          fi
           if [ "$part" = lib ]; then
             # Bibliothèque par cargo test : sous nextest, issue2875 (enfant de procsub) relance le binaire de test
             # (« Unrecognized option: c », rouge aussi en amont) ; sous cargo test le test passe (prd, 2026-11-13).
-            exec cargo test --locked --lib -- --test-threads=4
+            exec cargo test --locked --lib
           fi
           mapfile -t cargo_only < <(grep -vE '^(#|$)' .config/aphrody-cargo-test.txt)
           if [ "$part" = cargo ]; then
             cargo_args=()
             for stem in "${cargo_only[@]}"; do cargo_args+=(--test "$stem"); done
-            exec cargo test --locked --no-fail-fast "${cargo_args[@]}" -- --test-threads=4
+            exec cargo test --locked --no-fail-fast "${cargo_args[@]}"
           fi
           mapfile -t excluded < <(grep -vE '^(#|$)' scripts/ci-pin-exclusions.txt | cut -d' ' -f1)
           excluded+=("${cargo_only[@]}")
