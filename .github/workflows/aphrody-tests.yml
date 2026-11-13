@@ -17,10 +17,13 @@ jobs:
     name: suite (${{ matrix.part }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # legacy : cibles hors du portail amont (executor_tests, deep_audit_*, ...), lancées pour le tri mais non
+    # bloquantes, comme dans la CI amont qui ne les exécute pas.
+    continue-on-error: ${{ matrix.part == 'legacy' }}
     strategy:
       fail-fast: false
       matrix:
-        part: [lib, cargo, pins-0, pins-1, pins-2, pins-3, pins-4, pins-5, other]
+        part: [lib, cargo, pins-0, pins-1, pins-2, pins-3, pins-4, pins-5, other, legacy]
     env:
       CARGO_TERM_COLOR: never
     steps:
@@ -76,7 +79,12 @@ jobs:
             stem=$(basename "$f" .rs)
             case " ${excluded[*]} " in *" $stem "*) continue ;; esac
             case "$part" in
-              other) [[ $stem == issue* ]] && continue ;;
+              # other : les cibles non-issue que la CI amont exécute (cli_tests, marker_leak_golden, regression).
+              other) case $stem in cli_tests | marker_leak_golden | regression) ;; *) continue ;; esac ;;
+              legacy)
+                [[ $stem == issue* ]] && continue
+                case $stem in cli_tests | marker_leak_golden | regression) continue ;; esac
+                ;;
               pins-*)
                 [[ $stem == issue* ]] || continue
                 [ $((i % 6)) -eq "${part#pins-}" ] || { i=$((i + 1)); continue; }
