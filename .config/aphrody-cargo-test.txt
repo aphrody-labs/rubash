@@ -1,8 +1,5 @@
-# Cibles lancées par `cargo test` et non par nextest dans le workflow « aphrody tests » : sous nextest
-# (runner ubuntu-latest), leur lancement de target/debug/rubash échoue (ENOENT au spawn) ou le pli de fd
-# diffère, alors que `cargo test` les passe (prd, 2026-11-13, rubash@ae43f3e5).
+# Cibles lancées par `cargo test` (série, RUST_TEST_THREADS=1 de .config) et non par nextest dans le
+# workflow « aphrody tests » : sous nextest, le pli de descripteurs (2029) et le diagnostic de basename
+# du sous-shell (2086) divergent sur ubuntu-latest alors que `cargo test` les passe.
 issue2029_fd_offset_fold_regressions
-issue2043_sync_a_class_regressions
-issue2046_s6_four_cells
-issue2046_sync_b_class_regressions
 issue2086_comsub_child_stderr_regressions

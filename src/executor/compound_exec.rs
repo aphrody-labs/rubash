@@ -7625,20 +7625,52 @@ fn parameter_expansion_assigns(raw: &str) -> bool {
     false
 }
 
+/// The real rubash binary next to a test executable. Cargo's classic layout puts test
+/// executables in `target/<profile>/deps/`; its build-dir layout (cargo 1.9x) puts them in
+/// `target/<profile>/build/<pkg>/<hash>/out/`. In both the binary is `target/<profile>/rubash`:
+/// the profile directory is the parent of `deps` or of `build`.
 pub(in crate::executor) fn test_rubash_binary_from_current_exe() -> Option<std::path::PathBuf> {
     let current = std::env::current_exe().ok()?;
-    let deps = current.parent()?;
-    if deps.file_name().and_then(|name| name.to_str()) != Some("deps") {
-        return None;
-    }
-    let debug_dir = deps.parent()?;
+    test_rubash_binary_near(&current)
+}
+
+pub(in crate::executor) fn test_rubash_binary_near(current: &std::path::Path) -> Option<std::path::PathBuf> {
     let binary_name = if cfg!(windows) {
         "rubash.exe"
     } else {
         "rubash"
     };
-    let candidate = debug_dir.join(binary_name);
+    let profile_dir = current.ancestors().skip(1).find_map(|dir| {
+        match dir.file_name().and_then(|name| name.to_str()) {
+            Some("deps") | Some("build") => dir.parent(),
+            _ => None,
+        }
+    })?;
+    let candidate = profile_dir.join(binary_name);
     candidate.is_file().then_some(candidate)
+}
+
+#[cfg(test)]
+mod test_binary_layout_tests {
+    use super::test_rubash_binary_near;
+
+    #[test]
+    fn finds_the_binary_from_deps_and_from_build_dir_layouts() {
+        let root = std::env::temp_dir().join(format!("rubash-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile = root.join("debug");
+        let deps = profile.join("deps");
+        let out = profile.join("build").join("rubash").join("0123abcd").join("out");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let bin = profile.join(if cfg!(windows) { "rubash.exe" } else { "rubash" });
+        assert_eq!(test_rubash_binary_near(&deps.join("t-1")), None, "no binary yet");
+        std::fs::write(&bin, b"").unwrap();
+        assert_eq!(test_rubash_binary_near(&deps.join("t-1")), Some(bin.clone()));
+        assert_eq!(test_rubash_binary_near(&out.join("t-1")), Some(bin.clone()));
+        assert_eq!(test_rubash_binary_near(&root.join("elsewhere").join("t")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 fn case_pattern_has_extglob(pattern: &str) -> bool {
