@@ -10,5 +10,8 @@ termination-timeout = "10s"
 # (2 min) au lieu de bloquer la part jusqu'au délai du job.
 [profile.aphrody]
 slow-timeout = { period = "30s", terminate-after = 4 }
+# Tests de contrôle de jobs sensibles au minutage (issue2340 bare_wait_survivor : rouge 1 fois sur 3 runs) :
+# nextest les relance et les signale « flaky » au lieu de rougir la part.
+retries = 2
 timeout-source = "profile"
 termination-timeout = "10s"
