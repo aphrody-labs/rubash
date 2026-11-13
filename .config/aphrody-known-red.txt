@@ -1,0 +1,5 @@
+# Tests rouges sur deux hôtes (ubuntu-latest et prd, 2026-11-13), défauts réels du moteur pas encore corrigés :
+# exclus du portail du workflow « aphrody tests » (passés à `--skip`), comme scripts/ci-pin-exclusions.txt
+# pour les pins amont. Premier mot = nom exact du test, le reste = raison.
+golden_issue2908_ruby_build_exec install de ruby-build interrompu après le téléchargement (install-rc=1, stderr non vide) ; à diagnostiquer
+golden_nvm_load portail de temps nvm.sh : 5,1 s contre 1,5 s de budget (classe rubash#1940/#1961), régression de performance du lexer

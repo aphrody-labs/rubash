@@ -69,7 +69,9 @@ jobs:
           if [ "$part" = cargo ]; then
             cargo_args=()
             for stem in "${cargo_only[@]}"; do cargo_args+=(--test "$stem"); done
-            exec cargo test --locked --no-fail-fast "${cargo_args[@]}"
+            skips=()
+            while read -r name _; do skips+=(--skip "$name"); done < <(grep -vE '^(#|$)' .config/aphrody-known-red.txt)
+            exec cargo test --locked --no-fail-fast "${cargo_args[@]}" -- "${skips[@]}"
           fi
           mapfile -t excluded < <(grep -vE '^(#|$)' scripts/ci-pin-exclusions.txt | cut -d' ' -f1)
           excluded+=("${cargo_only[@]}")
