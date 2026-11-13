@@ -64,6 +64,13 @@ jobs:
           fi
           mapfile -t cargo_only < <(grep -vE '^(#|$)' .config/aphrody-cargo-test.txt)
           if [ "$part" = cargo ]; then
+            ls -la target/debug/rubash target/debug/deps/issue2043_sync_a_class_regressions-* 2>&1 | head -5
+            (cd "${TMPDIR:-/tmp}" && "$GITHUB_WORKSPACE/target/debug/rubash" -c 'echo probe-ok' ; echo "probe rc=$?")
+            sudo apt-get install -y -qq strace >/dev/null 2>&1 || true
+            cargo test --locked --test issue2043_sync_a_class_regressions --no-run 2>&1 | tail -2
+            t=$(ls target/debug/deps/issue2043_sync_a_class_regressions-* | grep -v '\.d$' | head -1)
+            strace -f -e trace=execve,chdir,clone3 -o "$RUNNER_TEMP/st.txt" "$t" issue2043_a1 >/dev/null 2>&1 || true
+            grep -E 'execve|chdir|ENOENT' "$RUNNER_TEMP/st.txt" | head -20
             cargo_args=()
             for stem in "${cargo_only[@]}"; do cargo_args+=(--test "$stem"); done
             exec cargo test --locked --no-fail-fast "${cargo_args[@]}"
