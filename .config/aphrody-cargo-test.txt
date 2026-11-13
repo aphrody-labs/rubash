@@ -1,5 +1,4 @@
-# Cibles lancées par `cargo test` (série, RUST_TEST_THREADS=1 de .config) et non par nextest dans le
-# workflow « aphrody tests » : sous nextest, le pli de descripteurs (2029) et le diagnostic de basename
-# du sous-shell (2086) divergent sur ubuntu-latest alors que `cargo test` les passe.
+# Cibles lancées par `cargo test` (série, RUST_TEST_THREADS=1 de .cargo/config.toml) et non par nextest
+# dans le workflow « aphrody tests » : en parallèle sous nextest, le pli de descripteurs de 2029 diverge
+# sur ubuntu-latest, alors que la série le passe (CI 2026-11-13).
 issue2029_fd_offset_fold_regressions
-issue2086_comsub_child_stderr_regressions

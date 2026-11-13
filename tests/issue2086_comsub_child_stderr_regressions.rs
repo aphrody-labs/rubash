@@ -45,6 +45,9 @@ fn run_script(dir: &Path, body: &str, extra_path: Option<&Path>) -> (String, Str
     command
         .arg(&script)
         .current_dir(dir)
+        // GNU diagnostics are compared byte for byte: a UTF-8 locale makes coreutils quote with
+        // U+2018/U+2019 instead of ASCII apostrophes.
+        .env("LC_ALL", "C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(bin) = extra_path {
