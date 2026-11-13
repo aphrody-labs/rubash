@@ -36,6 +36,8 @@ fn run(script: &str, dir: &std::path::Path) -> Output {
         .arg("-c")
         .arg(script)
         .current_dir(dir)
+        // Byte-exact GNU diagnostics: a UTF-8 locale switches coreutils to curly quotes.
+        .env("LC_ALL", "C")
         .output()
         .expect("spawn rubash");
     Output {
