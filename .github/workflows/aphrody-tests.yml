@@ -1,8 +1,9 @@
 name: aphrody tests
 
-# Suite complète de rubash pour la chaîne aphrody (monorepo src, docs/unixwin/LEARNINGS.md) : la crate unique
-# est découpée en lots (bibliothèque + tests/*.rs répartis en 8 parts), descripteurs relevés, TMPDIR dans le
-# workspace. prd n'exécute plus la suite complète.
+# Suite complète de rubash pour la chaîne aphrody (monorepo src, docs/unixwin/LEARNINGS.md), sur le même socle
+# que la CI amont (sous-modules, binaire construit avant les tests, fixture bashdb, nextest profil ci avec
+# délais) : bibliothèque, puis tests/*.rs découpés en parts. Les exclusions sont celles de l'amont
+# (scripts/ci-pin-exclusions.txt). ulimit -n relevé, TMPDIR dans le workspace. prd n'exécute plus la suite.
 on:
   push:
     branches: [master]
@@ -19,36 +20,55 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [lib, "0", "1", "2", "3", "4", "5", "6", "7"]
+        part: [lib, pins-0, pins-1, pins-2, pins-3, pins-4, pins-5, other]
     env:
       CARGO_TERM_COLOR: never
-      RUST_BACKTRACE: "0"
     steps:
       - uses: actions/checkout@v4.2.2
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1.11
         with:
-          cache: true
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare external bashdb fixture
+        run: |
+          git clone --depth 1 --branch bash-5.3 https://github.com/Trepan-Debuggers/bashdb.git target/bashdb-source
+          cd target/bashdb-source
+          bash ./autogen.sh
+          ./configure --prefix="$GITHUB_WORKSPACE/target/bashdb-install"
+          make -j2
+          make install
+          cd "$GITHUB_WORKSPACE"
+          bash scripts/setup-bashdb-fixture.sh target/bashdb-install
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Build the rubash binary
+        run: cargo build --locked
       - name: Run part
         shell: bash
         run: |
           ulimit -n 65536
-          export TMPDIR="$GITHUB_WORKSPACE/.tmp"
+          export TMPDIR="$GITHUB_WORKSPACE/target/tmp"
           mkdir -p "$TMPDIR"
-          if [ "${{ matrix.part }}" = lib ]; then
-            cargo test --locked --lib -- --test-threads=4
-            exit
+          part='${{ matrix.part }}'
+          if [ "$part" = lib ]; then
+            exec cargo nextest run --lib --profile ci --no-fail-fast
           fi
+          mapfile -t excluded < <(grep -vE '^(#|$)' scripts/ci-pin-exclusions.txt | cut -d' ' -f1)
           args=()
           i=0
           for f in tests/*.rs; do
-            if [ $((i % 8)) -eq ${{ matrix.part }} ]; then
-              args+=(--test "$(basename "$f" .rs)")
-            fi
-            i=$((i + 1))
+            stem=$(basename "$f" .rs)
+            case " ${excluded[*]} " in *" $stem "*) continue ;; esac
+            case "$part" in
+              other) [[ $stem == issue* ]] && continue ;;
+              pins-*)
+                [[ $stem == issue* ]] || continue
+                [ $((i % 6)) -eq "${part#pins-}" ] || { i=$((i + 1)); continue; }
+                i=$((i + 1))
+                ;;
+            esac
+            args+=(--test "$stem")
           done
-          echo "${#args[@]} arguments, part ${{ matrix.part }}"
-          cargo test --locked --no-fail-fast "${args[@]}" -- --test-threads=4 2>&1 | tee "$TMPDIR/part.log"
-          code=${PIPESTATUS[0]}
-          grep -E '^---- |^test result: FAILED' "$TMPDIR/part.log" | head -400 || true
-          exit "$code"
+          echo "part $part : $(( ${#args[@]} / 2 )) cibles"
+          cargo nextest run --profile ci --no-fail-fast "${args[@]}"
