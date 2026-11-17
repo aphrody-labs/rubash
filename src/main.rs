@@ -214,13 +214,27 @@ fn run_main() -> i32 {
     // restore and the signal-mailbox unregister — a dying process's
     // environment is unobservable, and stale markers self-heal in
     // deliver()'s dead-pid path plus the registration thread's prune.
-    if let Ok(path) = env::current_exe() {
+    // rubash#3318: GNU variables.c:776 get_bash_name seeds $BASH from the
+    // INVOCATION path (shell_name, i.e. argv[0]) — absolute verbatim,
+    // `./` PWD-joined, bare name through the PATH walk — never
+    // canonicalized, so an invocation through a symlink keeps the link.
+    // std::env::current_exe resolves symlinks; it stays only as the
+    // fallback when the invocation name resolves to nothing.
+    let process_env: std::collections::HashMap<String, String> = env::vars().collect();
+    let bash_value = args
+        .first()
+        .and_then(|argv0| rubash::executor::bash_invocation_name(argv0, &process_env))
+        .or_else(|| {
+            env::current_exe()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        });
+    if let Some(path) = bash_value {
         // rubash#331: self-produced path values render in POSIX form
         // (/d/...) like $PWD — GNU's own BASH is a POSIX path, and the
         // previous drive-form export made `$BASH` and `$PWD` disagree in
         // form within one shell.
-        let path =
-            rubash::executor::shell_pwd_display_path(&path.to_string_lossy().replace('\\', "/"));
+        let path = rubash::executor::shell_pwd_display_path(&path.replace('\\', "/"));
         // rubash#1325: GNU seeds $BASH WITHOUT the export attribute
         // (variables.c: BASH is a plain shell variable; `export -p` in a
         // clean env lists only OLDPWD/PWD/SHLVL). export_env here made
@@ -1432,7 +1446,11 @@ fn parse_long_options(
 fn show_shell_usage(startup_error_name: &str) {
     // The usage name is the shell_name face, not the $0 face: empty
     // means "bash" here (see the doc comment above).
-    let usage_name = if startup_error_name.is_empty() { "bash" } else { startup_error_name };
+    let usage_name = if startup_error_name.is_empty() {
+        "bash"
+    } else {
+        startup_error_name
+    };
     eprint!(
         "{usage_name} [GNU long option] [option] ...
 {usage_name} [GNU long option] [option] script-file ...
@@ -2250,8 +2268,25 @@ fn start_debugger(executor: &mut Executor) {
 
 fn run_init_file(executor: &mut Executor, init_file: &str) -> i32 {
     let path = executor.resolve_shell_path(init_file);
+    // GNU builtins/evalfile.c:133-138 _evalfile: the fstat'd descriptor
+    // is checked for S_ISDIR before any read and reported as `%s: is a
+    // directory` (internal_error). Windows refuses to open a directory
+    // for reading at all (PermissionDenied), so test the file type first
+    // to keep GNU's text instead of the open error's.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+        eprintln!("rubash: {init_file}: is a directory");
+        return 1;
+    }
     let contents = match rubash::script_driver::read_script_bytes(&path) {
         Ok(contents) => contents,
+        // GNU shell.c run_startup_files sources every startup file through
+        // builtins/evalfile.c:339 maybe_execute_file, whose flags carry
+        // FEVAL_ENOENTOK: a file that does not exist is skipped without a
+        // diagnostic (evalfile.c:120 `if (((flags & FEVAL_ENOENTOK) == 0)
+        // || errno != ENOENT) file_error (filename);`) and the call returns
+        // 0 (evalfile.c:130). Every other open failure (EACCES, ...) is
+        // still reported (rubash#3457).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(e) => {
             // rubash#3254: the driver-time name (see
             // driver_error_name). NOTE: GNU stays silent when a

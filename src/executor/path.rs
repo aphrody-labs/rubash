@@ -641,13 +641,35 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
         // hash table survives PATH changes — consult the mirrored
         // hash-table entries first, even right after a fingerprint reset
         // (rubash#1137).
+        //
+        // The consult is phash_search itself (hashcmd.c:126): a stored
+        // relative spelling is re-validated against the cwd on every read
+        // and may answer NULL (a deleted `./name`), which sends the lookup
+        // on to the PATH walk with the entry kept (rubash#3359). The
+        // PATH-scan memo for the name is stale evidence then too.
         if let Some(result) = mirror.get(name).cloned() {
             if let Some(path) = &result {
-                if crate::builtins::shopt::checkhash_enabled() && !cached_path_still_valid(path) {
-                    mirror.remove(name);
-                    cache.results.remove(name);
-                } else {
-                    return Some(path.clone());
+                match crate::builtins::hash::phash_search_spelling(
+                    &path.to_string_lossy(),
+                    env_vars,
+                ) {
+                    None => {
+                        cache.results.remove(name);
+                    }
+                    Some(served) => {
+                        let served = PathBuf::from(served);
+                        if crate::builtins::shopt::checkhash_enabled()
+                            && !cached_path_still_valid(&anchor_at_session_cwd(
+                                served.clone(),
+                                env_vars,
+                            ))
+                        {
+                            mirror.remove(name);
+                            cache.results.remove(name);
+                        } else {
+                            return Some(served);
+                        }
+                    }
                 }
             } else {
                 return None;
@@ -1395,6 +1417,38 @@ pub(crate) fn recorded_resolution_spelling(
         }
     }
     super::execution_misc::shell_display_path(&program.to_string_lossy().replace('\\', "/"))
+}
+
+/// niubash#993 S7: Git Bash/MSYS describe display drops the `.exe`
+/// probe suffix — `command -v cat` prints `/usr/bin/cat` for the
+/// `cat.exe` body (the POSIX layer resolves `name` -> `name.exe`
+/// transparently, so the as-written `<elem>/<name>` join
+/// findcmd.c:553 sh_makepath builds never carries the suffix).
+/// Applies only when the resolved display literally names
+/// `<elem>/<name>.exe`: a name the user typed with the suffix keeps
+/// it (`command -v cat.exe` -> `.../cat.exe`), and non-.exe bodies
+/// (`foo.bat`) keep their real filename — Git Bash does not probe
+/// them for a bare name at all. Display-only: the stored/executed
+/// resolution keeps the real filename. Unconditional: the unix walk
+/// never produces a `name.exe` hit for a bare `name`, so the helper
+/// is inert off Windows by construction.
+pub(crate) fn drop_exe_probe_suffix(name: &str, display: String) -> String {
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() >= 4 && name_bytes[name_bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        return display;
+    }
+    let tail = format!("{name}.exe");
+    let disp = display.as_bytes();
+    if disp.len() > tail.len()
+        && disp[disp.len() - tail.len()..].eq_ignore_ascii_case(tail.as_bytes())
+        && matches!(disp[disp.len() - tail.len() - 1], b'/' | b'\\')
+    {
+        let mut display = display;
+        display.truncate(display.len() - 4);
+        display
+    } else {
+        display
+    }
 }
 
 /// rubash#2442: the one filename-resolution funnel every external
@@ -8506,12 +8560,19 @@ pub fn shell_pwd_display_path(path: &str) -> String {
         && value.as_bytes()[2] == b'/'
     {
         let drive = (value.as_bytes()[0] as char).to_ascii_lowercase();
-        return format!("/{drive}/{}", &value[3..]);
+        // niubash#993 S2: the drive ROOT renders `/c`, not `/c/` —
+        // GNU's canonpath strips the trailing separator of every
+        // non-`/` root and Git Bash prints `cd /c; pwd` -> `/c`.
+        let tail = &value[3..];
+        if tail.is_empty() {
+            return format!("/{drive}");
+        }
+        return format!("/{drive}/{tail}");
     }
     // unixwin/niubash#481: the bare drive-root display `D:` — produced by
     // the display normalization of a `D:/` operand, which drops the
     // trailing separator — is the same drive root the `D:/` arm above
-    // renders `/d/`; folding it here keeps the canonical persona form
+    // renders `/d`; folding it here keeps the canonical persona form
     // instead of leaking the designator into $PWD.
     if cfg!(windows)
         && value.len() == 2
@@ -8519,11 +8580,99 @@ pub fn shell_pwd_display_path(path: &str) -> String {
         && value.as_bytes()[1] == b':'
     {
         let drive = (value.as_bytes()[0] as char).to_ascii_lowercase();
-        return format!("/{drive}/");
+        return format!("/{drive}");
     }
     if value.is_empty() {
         "/".to_string()
     } else {
         value
+    }
+}
+
+/// GNU variables.c:776 get_bash_name: the `$BASH` seed is the INVOCATION
+/// path, never the resolved binary — an absolute argv[0] survives
+/// verbatim (symlinks kept), a `./name` spelling joins $PWD textually, a
+/// bare name resolves through the PATH walk (the join as written), and
+/// any other slash-bearing relative spelling absolutizes onto $PWD —
+/// versus rubash's former `std::env::current_exe`, which canonicalizes
+/// `/tmp/linkbash` to the real binary (rubash#3318). None when nothing
+/// resolves: GNU falls back to the login shell there, and the caller
+/// keeps its existing fallback.
+pub fn bash_invocation_name(argv0: &str, env_vars: &HashMap<String, String>) -> Option<String> {
+    // set_shell_name (shell.c:1795) keeps argv[0] verbatim including a
+    // `-` login mark; for get_bash_name's purposes the mark only ever
+    // precedes the bare name (`-bash`), so strip it for resolution.
+    let name = argv0.strip_prefix('-').unwrap_or(argv0);
+    if name.is_empty() {
+        return None;
+    }
+    if invocation_path_is_absolute(name) {
+        return Some(name.to_string());
+    }
+    // GNU set_pwd() (shell.c) validates an inherited $PWD against getcwd
+    // and resets it when they are not the same file, so a stale PWD must
+    // not feed the textual joins below.
+    let pwd = || -> Option<String> {
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|dir| dir.to_string_lossy().into_owned())?;
+        let env_pwd = env_vars.get("PWD").filter(|value| !value.is_empty());
+        match env_pwd {
+            Some(env_pwd)
+                if std::fs::canonicalize(env_pwd)
+                    .map(|resolved| resolved == std::path::Path::new(&cwd))
+                    .unwrap_or(false) =>
+            {
+                Some(env_pwd.clone())
+            }
+            _ => Some(cwd),
+        }
+    };
+    if let Some(rest) = name.strip_prefix("./") {
+        // variables.c:790-799: the `./` fast path joins PWD literally.
+        return pwd().map(|pwd| format!("{pwd}/{rest}"));
+    }
+    if name.contains('/') {
+        // `dir/name` and `../dir/name`: find_user_command does not
+        // PATH-search slash spellings, so GNU lands on file_status +
+        // make_absolute — a textual $PWD join with `.`/`..` components
+        // normalized (full_pathname's contract; symlinks untouched).
+        let joined = format!("{}/{}", pwd()?, name);
+        return Some(
+            std::path::Path::new(&joined)
+                .components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    find_user_command(name, env_vars).map(|path| {
+        let joined = path.to_string_lossy().into_owned();
+        if invocation_path_is_absolute(&joined) {
+            joined
+        } else {
+            // full_pathname (general.c) absolutizes a relative join
+            // against $PWD.
+            pwd().map(|pwd| format!("{pwd}/{joined}")).unwrap_or(joined)
+        }
+    })
+}
+
+/// The absolute-path test for an invocation spelling — the ABSPATH macro
+/// behind variables.c:785 get_bash_name. POSIX (general.h:266) is
+/// `x[0] == '/'` only; the __CYGWIN__ port (general.h:269) — the Windows
+/// spellings get_bash_name must recognize — counts a drive-letter
+/// designator (`C:` anything, including the drive-relative `C:name`) or
+/// a leading directory separator of EITHER spelling (general.h:279
+/// ISDIRSEP), so `C:\…`, `C:/…`, `\dir\…`, `\\?\…` and `\\server\…` are
+/// all already absolute and keep verbatim instead of falling into the
+/// PATH walk or the textual $PWD join (rubash#3318 rework).
+fn invocation_path_is_absolute(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if cfg!(windows) {
+        matches!(bytes.first(), Some(b'/') | Some(b'\\'))
+            || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    } else {
+        bytes.first() == Some(&b'/')
     }
 }

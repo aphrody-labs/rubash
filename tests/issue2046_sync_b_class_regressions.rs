@@ -14,9 +14,14 @@
 
 use std::process::Command;
 
-// Cargo sets CARGO_BIN_EXE_<bin> for integration tests; the old current_exe()/../../rubash
-// walk broke under cargo's build-dir layout (target/debug/build/<pkg>/<hash>/out/<test>).
 fn rubash() -> std::path::PathBuf {
+    // `current_exe` is the test binary, and its directory is
+    // toolchain-layout-dependent (`deps/` on the classic build dir,
+    // `build/<pkg>/<fingerprint>/out/` on the newer cargo layout), so
+    // a fixed pop-pop walk cannot name the bin target. `CARGO_BIN_EXE`
+    // is the compile-time anchor cargo sets for integration tests of a
+    // package with a `rubash` bin — layout-independent on every
+    // toolchain (rubash#3605 CI).
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_rubash"))
 }
 
