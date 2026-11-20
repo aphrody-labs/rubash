@@ -406,6 +406,25 @@ impl Executor {
         // word the carrier path IS the expansion; return it verbatim.
         if operand_is_procsub(&redirect.target) || operand_is_procsub(&redirect.target_metadata.raw)
         {
+            // rubash#3808: a bare process-substitution operand expands to
+            // exactly ONE field — GNU redir.c:296-333 redirection_expand
+            // returns NULL (the AMBIGUOUS_REDIRECT condition) only for
+            // zero or several fields, and expand_word_internal's `<`/`>`
+            // cases (subst.c:11364-11391) extract the substitution whole
+            // (extract_process_subst, subst.c:1311) and splice the single
+            // /dev/fd/N filename in, so the body's characters are never
+            // this word's expansion introducers: a `{ ...; }` group body's
+            // `{` is a compound-command opener, not a brace-expansion
+            // candidate. Record the single-field verdict here (the #3089
+            // memo both ambiguity gates consult) so the textual gate
+            // below never misreads the body's `{` as a multi-field
+            // expansion — the subshell-list body passed only because it
+            // carries no such character, while the group body was
+            // rejected as ambiguous.
+            self.redirect_target_memo.borrow_mut().insert(
+                Self::redirect_target_field_memo_key(redirect, true),
+                String::new(),
+            );
             // rubash#394: while a compound command whose target IS a
             // process substitution is in scope, the substitution's carrier
             // path stands in for the text — the compound fd-table walk runs
@@ -668,6 +687,24 @@ impl Executor {
         if !crate::executor::markers::contains_decodable_transport(expanded) {
             return;
         }
+        // The `>&`/`<&` stored operand carries a synthetic leading `&`
+        // (parser/redirections.rs redirect_target /
+        // input_redirect_target) that is operator syntax, never
+        // filename content — GNU redir.c:832-838 opens `word` for
+        // `>&word`. The recorded spelling is the filename's bytes,
+        // so the `&` comes off before decoding; every `&`-stripping
+        // consumer (and the node-aware opens) then resolves the same
+        // name GNU opens. A literal `&` inside the word survives:
+        // `>&"&$a"` stores `&&...` and loses only the synthetic one.
+        let expanded = match redirect.kind {
+            crate::parser::RedirectKind::DuplicateInput
+            | crate::parser::RedirectKind::DuplicateOutput
+            | crate::parser::RedirectKind::CloseInput
+            | crate::parser::RedirectKind::CloseOutput => {
+                expanded.strip_prefix('&').unwrap_or(expanded)
+            }
+            _ => expanded,
+        };
         let decoded = crate::executor::markers::decode_word_position_carriers(
             &expanded.replace(crate::executor::markers::CTLESC, ""),
         );
@@ -1423,7 +1460,17 @@ impl Executor {
                 return Some(String::new());
             }
             if crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
-                if let Some(name) = arithmetic_unbound_variable(&expression, &overlaid) {
+                // GNU expr.c:1190-1216 expr_streval traps only a name the
+                // evaluator actually reads — never under a noeval
+                // short-circuit (`0 && u`), never an assignment target
+                // (rubash#3496/#3563 row 1). Judge the body with the real
+                // evaluator on a scratch copy (arith_body_nounset_trap),
+                // never with the expression-text scan it replaces: the
+                // scan trapped `u` in `$(( 0 && u ))` on for-list words
+                // and redirect targets, where GNU expands to 0.
+                if let Some(name) =
+                    crate::executor::arithmetic::arith_body_nounset_trap(&expression, &overlaid)
+                {
                     if !self.shell_state.arithmetic_expansion_error.replace(true) {
                         self.write_diagnostic_fd2(
                             format!("{}{}: unbound variable\n", self.error_prefix(), name)
@@ -1443,8 +1490,12 @@ impl Executor {
             // into the deferred-write queue (same channel as the embedded
             // parameter walker's arithmetic arm) for the mutable caller to
             // apply.
-            let (value, writes, actual_category) =
-                eval_conditional_arith_value_categorized_with_writes(&expression, &overlaid);
+            // GNU subst.c:10873-10878 arithsub clears
+            // this_command_name around evalexp (rubash#3295).
+            let (value, writes, actual_category) = {
+                let _arith_label = crate::executor::arithmetic::arith_eval_label_scope(None);
+                eval_conditional_arith_value_categorized_with_writes(&expression, &overlaid)
+            };
             if !writes.is_empty() {
                 crate::executor::expand_braced_indices::PENDING_SUBSCRIPT_WRITES
                     .with(|pending| pending.borrow_mut().extend(writes));
@@ -1455,6 +1506,28 @@ impl Executor {
             self.shell_state
                 .arithmetic_last_error_category
                 .set(actual_category);
+            // GNU expr.c:1190-1216 expr_streval: a body the verdict-only
+            // scan above could not judge (it holds an expansion
+            // character, so arith_body_nounset_trap yields no verdict)
+            // still traps at this real evaluation — report the
+            // evaluator's name and take the nounset fatal class instead
+            // of synthesizing a syntax error from the expression text
+            // (rubash#3563 row 1: the `di=undef+1` face of the same gap
+            // is fixed at eval_integer_assignment_checked).
+            if actual_category
+                == Some(crate::executor::arithmetic::ArithmeticErrorCategory::UnboundVariable)
+            {
+                if let Some(name) = crate::executor::arithmetic::take_arith_unbound_name() {
+                    if !self.shell_state.arithmetic_expansion_error.replace(true) {
+                        self.write_diagnostic_fd2(
+                            format!("{}{}: unbound variable\n", self.error_prefix(), name)
+                                .as_bytes(),
+                        );
+                    }
+                    self.shell_state.arithmetic_nounset_error.set(true);
+                    return Some(String::new());
+                }
+            }
             // Bash reports arithmetic expansion errors (floating point,
             // negative exponent, division by zero, ...) on stderr instead of
             // silently producing nothing, and abandons the enclosing command

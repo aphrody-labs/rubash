@@ -634,7 +634,7 @@ impl Executor {
     /// arithmetic entry's clear-to-drain window, so no entry-owned
     /// event can be in the log here.
     pub(in crate::executor) fn apply_pending_subscript_writes(&mut self) {
-        self.drain_arith_eval_events(None);
+        self.drain_arith_eval_events();
         let writes = PENDING_SUBSCRIPT_WRITES.with(|w| std::mem::take(&mut *w.borrow_mut()));
         for (name, value) in writes {
             if self.shell_state.env_vars.get(&name) != Some(&value) {
@@ -1007,17 +1007,22 @@ impl Executor {
                 // rubash#299).
                 let overlaid = env_vars_with_pending_subscript_writes(&self.shell_state.env_vars);
                 let dynamic_values = self.arith_dynamic_context();
-                let (result, writes) = eval_conditional_arith_value_with_writes(
-                    expr.trim(),
-                    &overlaid,
-                    Some(&self.shell_state.random_state),
-                    Some(&dynamic_values),
-                    if matches!(&overlaid, std::borrow::Cow::Borrowed(_)) {
-                        Some(&self.shell_state.variables)
-                    } else {
-                        None
-                    },
-                );
+                // GNU arrayfunc.c:1373-1377 array_expand_index clears
+                // this_command_name around evalexp (rubash#3295).
+                let (result, writes) = {
+                    let _arith_label = crate::executor::arithmetic::arith_eval_label_scope(None);
+                    eval_conditional_arith_value_with_writes(
+                        expr.trim(),
+                        &overlaid,
+                        Some(&self.shell_state.random_state),
+                        Some(&dynamic_values),
+                        if matches!(&overlaid, std::borrow::Cow::Borrowed(_)) {
+                            Some(&self.shell_state.variables)
+                        } else {
+                            None
+                        },
+                    )
+                };
                 if !writes.is_empty() {
                     PENDING_SUBSCRIPT_WRITES.with(|w| {
                         w.borrow_mut().extend(writes);
@@ -1227,6 +1232,26 @@ impl Executor {
         length: Option<isize>,
     ) -> Option<String> {
         let indirect_name = var_name.strip_prefix('!')?;
+        // VALID_INDIR_PARAM specials (subst.c:122; subst.c:7839-7881
+        // parameter_brace_find_indir): `${!#:0:1}` resolves t through the
+        // special parameter's scalar value first, then slices the
+        // parameter t names — with $#=2 it is `${2:0:1}`, not a lookup of
+        // an env cell literally named `#`. An all-digit source is the
+        // same find_indir step through get_dollar_var_value
+        // (subst.c:3707): `${!00:1:2}` is `${$0:1:2}` (rubash#3784).
+        if indirect_name.len() == 1 && matches!(indirect_name, "#" | "?" | "@" | "*")
+            || !indirect_name.is_empty() && indirect_name.chars().all(|c| c.is_ascii_digit())
+        {
+            let Some(t) = self.indirect_holder_target_name(indirect_name) else {
+                return Some(String::new());
+            };
+            if !Self::is_valid_indirect_target(&t) {
+                // `<t>: invalid variable name` is diagnosed by the
+                // parameter-expansion error pre-scan.
+                return Some(String::new());
+            }
+            return Some(self.expand_braced_substring_parameter(&t, offset, length));
+        }
         if let Some(target_name) = self.nameref_target_name(indirect_name) {
             return Some(parameter_substring(&target_name, offset, length));
         }

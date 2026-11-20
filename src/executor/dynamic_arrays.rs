@@ -834,6 +834,47 @@ impl Executor {
         views
     }
 
+    /// The function half of the assignment-form listing
+    /// (print_all_shell_variables' print_func_list, builtins/set.def:
+    /// 518-527): every function in the table, rendered with the
+    /// listing form of the ast_print port (the name=NULL arm of
+    /// named_function_string — no `function ` fallback — plus the
+    /// definition metadata `declare -f` carries: body kind and
+    /// definition redirects), for print_shell_variables to print after
+    /// the variables when not in POSIX mode (rubash#3487).
+    ///
+    /// This render is O(total definition text) across the whole table,
+    /// so it must only run when a bare listing actually prints: the
+    /// declare/set funnels take it as a lazy
+    /// [`crate::builtins::set::FunctionSetViewProvider`] and the
+    /// executor call sites pass a closure over the two maps. Eagerly
+    /// materializing the views on every declare-family dispatch taxed
+    /// every `local` in a function-heavy shell (bats' library is ~150
+    /// functions) and made bats' gather pathologically slow
+    /// (rubash#3230).
+    pub(in crate::executor) fn render_function_set_views(
+        functions: &std::collections::HashMap<String, FunctionBody>,
+        function_def_infos: &std::collections::HashMap<String, FunctionDefInfo>,
+    ) -> Vec<crate::builtins::set::FunctionSetView> {
+        functions
+            .iter()
+            .map(|(name, body)| {
+                let info = function_def_infos.get(name);
+                let text = crate::parser::ast_print::multiline_function_listing_text(
+                    name,
+                    &body.commands,
+                    info.and_then(|info| info.body_kind),
+                    info.map(|info| info.def_redirects.as_slice())
+                        .unwrap_or(&[]),
+                );
+                crate::builtins::set::FunctionSetView {
+                    name: name.clone(),
+                    text,
+                }
+            })
+            .collect()
+    }
+
     /// The LISTING form of a dynamic variable's declaration view
     /// (rubash#2973): GNU enumeration renders the variable's CELL,
     /// and for the getter-backed dynamics the cell holds only what a
@@ -1532,6 +1573,103 @@ impl Executor {
         view
     }
 
+    /// GNU `init_bash_argv` (variables.c:5640-5650) for the `shopt -s
+    /// extdebug` trigger (builtins/shopt.def:618-626
+    /// `shopt_set_debug_mode`): enabling extdebug latches the
+    /// BASH_ARGV/BASH_ARGC bottom frame from the positional parameters
+    /// current at enable time (`save_bash_argv`/`push_args`,
+    /// variables.c:5652-5690), and the latch
+    /// (`bash_argv_initialized`) is never cleared by `shopt -u
+    /// extdebug`, so the frame stays visible inside later function
+    /// calls even with the option off again (rubash#2634). Unlike the
+    /// read-time materialization in `bash_arg_bottom_frame`, this runs
+    /// at any function depth — GNU's enable path has no
+    /// `variable_context == 0` guard (that guard lives only in the
+    /// `get_bashargcv` getter, variables.c:1656-1670), so an enable
+    /// inside a function latches that call's arguments and the frame
+    /// survives the return (oracle: `f(){ shopt -s extdebug; }; f a b`
+    /// leaves a top-level `BASH_ARGC=([0]="2")`).
+    pub(in crate::executor) fn init_bash_argv(&self) {
+        // rubash#3909: GNU init_bash_argv (variables.c:5640-5650) is a
+        // no-op once bash_argv_initialized is set — the flag, not the
+        // frame, is the initialization record. Without this guard a
+        // runtime `shopt -s extdebug` after startup arming would latch
+        // an empty frame and the shell would show ([0]="0") where GNU
+        // shows () (oracle: `-O extdebug -c 'shopt -u extdebug; shopt
+        // -s extdebug; f(){ declare -p BASH_ARGC; }; f a'` -> ([0]="1")
+        // with no bottom frame). The flag is set here whenever the init
+        // actually runs, even when the frame is already installed.
+        if self.shell_state.bash_argv_initialized.get() {
+            return;
+        }
+        self.shell_state.bash_argv_initialized.set(true);
+        if self.shell_state.bash_arg_bottom.borrow().is_none() {
+            *self.shell_state.bash_arg_bottom.borrow_mut() = Some(
+                self.shell_state
+                    .positional_window()
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect(),
+            );
+        }
+    }
+
+    /// rubash#3909: the startup arming marker for `bash_argv_initialized`
+    /// (variables.c:5640-5650). Called by the startup extdebug arming
+    /// sites — `-O extdebug` / `--debug` in main.rs, the shopt_flags and
+    /// `--debug` arms in invocation.rs, `Session::set` in api/views.rs —
+    /// which all run before any positional binding, mirroring GNU's
+    /// run_shopt_alist (shell.c:576): at that point the arrays do not
+    /// exist yet, so GNU's init sets the flag without pushing a frame.
+    /// It deliberately does NOT live in `set_shopt_option`: that funnel
+    /// also serves the runtime `shopt -s extdebug` builtin, whose hook
+    /// (option_builtins.rs, rubash#3427) calls `init_bash_argv` right
+    /// after — a flag set inside the setter would make that init a
+    /// no-op and the runtime enable would never latch its frame
+    /// (rubash#2634 `seed_on_off_in_function` would go () instead of
+    /// ([0]="0")). The flag is never cleared.
+    pub fn mark_bash_argv_initialized(&self) {
+        self.shell_state.bash_argv_initialized.set(true);
+    }
+
+    /// rubash#3909: GNU `bind_args` (shell.c:1504-1529), the startup
+    /// latch. Called immediately after each startup positional binding
+    /// (main.rs `-c` / `-s` / script-file arms, invocation.rs respawn
+    /// arm): when extdebug is currently on and the bound window is
+    /// non-empty, install the window (reversed) as the BASH_ARGV
+    /// bottom frame and set `bash_argv_initialized`, exactly as
+    /// bind_args does (`if (args) { remember_args (...); if
+    /// (debugging_mode) { push_args (...); bash_argv_initialized = 1;
+    /// } }`). The empty-window early return is the `if (args)` gate:
+    /// with no args there is nothing to push and the flag alone (set
+    /// by the arming site) records the initialization, so a later
+    /// top-level read shows () instead of synthesizing ([0]="0").
+    /// Must NOT be called from the shared `set_positional_params`
+    /// (its other callers — the `set` builtin, function calls,
+    /// `source` args — rebind mid-flight) and must NOT be called
+    /// before the binding (the window would be unbound).
+    pub fn latch_bash_argv_after_startup_bind(&self) {
+        if self.shell_state.bash_arg_bottom.borrow().is_some() {
+            return;
+        }
+        if !crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug") {
+            return;
+        }
+        if self.shell_state.positional_window().is_empty() {
+            return;
+        }
+        *self.shell_state.bash_arg_bottom.borrow_mut() = Some(
+            self.shell_state
+                .positional_window()
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+        );
+        self.shell_state.bash_argv_initialized.set(true);
+    }
+
     /// The installed BASH_ARGV bottom frame, or None while the arg
     /// arrays have never materialized. A read at the top level
     /// materializes the frame on the spot, exactly like variables.c
@@ -1544,6 +1682,19 @@ impl Executor {
     fn bash_arg_bottom_frame(&self) -> Option<Vec<String>> {
         if let Some(bottom) = self.shell_state.bash_arg_bottom.borrow().as_ref() {
             return Some(bottom.clone());
+        }
+        // rubash#3909: the third state. When bash_argv_initialized is
+        // set but no frame was installed (startup extdebug with no
+        // args, or a runtime re-enable after startup arming), the
+        // arrays are initialized-but-empty: GNU's get_bashargcv
+        // (variables.c:1656-1670) initializes only when the flag is
+        // clear, so a top-level read shows () and must NOT synthesize
+        // a ([0]="0") frame from the live window. The flag is never
+        // cleared, so this guard also blocks synthesis after a later
+        // `set --` rebind (oracle: `-O extdebug -c 'shopt -u extdebug;
+        // set -- p q; declare -p BASH_ARGC'` -> ()).
+        if self.shell_state.bash_argv_initialized.get() {
+            return None;
         }
         if self.shell_state.function_depth > 0 {
             return None;

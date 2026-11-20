@@ -12,12 +12,11 @@ pub(in crate::executor) fn format_redirect(operator: &str, redirect: &Redirect) 
             None => format!("{op}&{fd_target}"),
         };
     }
+    let target = super::command_text::redirect_target_source_text(redirect);
     match redirect.fd {
-        Some(_) if operator.starts_with(char::is_numeric) => {
-            format!("{operator} {}", redirect.target)
-        }
-        Some(fd) => format!("{fd}{operator} {}", redirect.target),
-        None => format!("{operator} {}", redirect.target),
+        Some(_) if operator.starts_with(char::is_numeric) => format!("{operator} {target}"),
+        Some(fd) => format!("{fd}{operator} {target}"),
+        None => format!("{operator} {target}"),
     }
 }
 
@@ -58,8 +57,10 @@ pub(in crate::executor) fn is_shell_keyword(word: &str) -> bool {
 /// (compgen -b, enable) exclude them exactly as GNU's table excludes
 /// them; since #2036 S2 the describe faces (type / command -v)
 /// disclose their in-process claims explicitly instead of reporting
-/// them as plain files. `env` IS listed below: it is rubash's one
-/// extension builtin (docs/builtins.md section 2).
+/// them as plain files. `env` is not listed either since rubash#3951:
+/// GNU has no `env` builtin, so it is an emulated external command
+/// (docs/builtins.md §3), not a builtin — its in-process
+/// implementation answers the simple-command face only.
 const BUILTIN_NAMES: &[&str] = &[
     ".",
     ":",
@@ -81,7 +82,6 @@ const BUILTIN_NAMES: &[&str] = &[
     "disown",
     "echo",
     "enable",
-    "env",
     "eval",
     "exec",
     "exit",

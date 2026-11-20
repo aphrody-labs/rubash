@@ -164,6 +164,70 @@ impl Executor {
             .map(|(_, _, env_name, bound)| (env_name.clone(), bound.clone()))
     }
 
+    /// The env composition paths for spawns whose prefix assignments
+    /// were never applied to the table (pipeline-stage spawners, the
+    /// concurrent / procsub composers) expand each assignment RHS
+    /// themselves. GNU walks the prefix list once, left to right:
+    /// do_assignment_statements (subst.c:13141) calls assign_in_env
+    /// (variables.c:3536) per word, which expands the RHS
+    /// (subst.c:3881 expand_assignment_string_to_string) and binds
+    /// into temporary_env, and variable lookup consults
+    /// temporary_env first (variables.c:1980) — so a later RHS sees
+    /// every earlier prefix bind (`a=1 b=$a env` yields b=1). Mirror
+    /// that here: stage each composed bind into the lookup path (the
+    /// env store, shadowing any typed cell) so the next RHS
+    /// expansion in the same composition reads it, and restore the
+    /// previous state when the composition finishes. The undo list
+    /// records each staged name once, in first-staged order.
+    pub(in crate::executor) fn stage_composition_bind(
+        &mut self,
+        undo: &mut Vec<(String, Option<String>, Option<crate::shell::Variable>)>,
+        name: &str,
+        value: &str,
+    ) {
+        if !undo.iter().any(|(staged, _, _)| staged == name) {
+            undo.push((
+                name.to_string(),
+                self.shell_state.env_vars.get(name).cloned(),
+                self.shell_state.variables.get(name).cloned(),
+            ));
+        }
+        self.shell_state
+            .env_vars
+            .insert(name.to_string(), value.to_string());
+        // The typed store is consulted before the env store
+        // (shell_variable_value), so a pre-existing typed cell would
+        // shadow the staged bind; drop it for the composition's
+        // duration — the undo entry restores it verbatim.
+        self.shell_state.variables.remove(name);
+    }
+
+    /// Undo every bind staged by
+    /// [`Executor::stage_composition_bind`], in reverse order.
+    pub(in crate::executor) fn restore_composition_binds(
+        &mut self,
+        undo: Vec<(String, Option<String>, Option<crate::shell::Variable>)>,
+    ) {
+        for (name, env_value, typed) in undo.into_iter().rev() {
+            match env_value {
+                Some(value) => {
+                    self.shell_state.env_vars.insert(name.clone(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove(&name);
+                }
+            }
+            match typed {
+                Some(variable) => {
+                    let _ = self.shell_state.variables.set(name, variable);
+                }
+                None => {
+                    self.shell_state.variables.remove(&name);
+                }
+            }
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub(in crate::executor) fn apply_temporary_assignments(
         &mut self,
@@ -1211,11 +1275,34 @@ impl Executor {
         &mut self,
         value: &str,
     ) -> Option<i128> {
-        if let Some(result) = crate::executor::arithmetic::eval_conditional_arith_value(
-            value,
-            &self.shell_state.env_vars,
-        ) {
+        let (result, _writes, category) =
+            crate::executor::arithmetic::eval_conditional_arith_value_categorized_with_writes(
+                value,
+                &self.shell_state.env_vars,
+            );
+        if let Some(result) = result {
             return Some(result);
+        }
+        // GNU variables.c:2905 make_variable_value: the att_integer RHS
+        // goes through the real evalexp, whose expr_streval read points
+        // own the nounset verdict — an unbound read is err_unboundvar +
+        // jump_to_top_level(FORCE_EOF) (expr.c:1190-1216), NOT an
+        // evalerror. The value-only evaluation discarded the category,
+        // so `declare -i di; di=undef+1` fell into the synthesized
+        // "operand expected" text below (rubash#3563). Report the trap
+        // and arm the nounset FORCE_EOF rails instead of the DISCARD.
+        if category == Some(crate::executor::arithmetic::ArithmeticErrorCategory::UnboundVariable) {
+            if let Some(name) = crate::executor::arithmetic::take_arith_unbound_name() {
+                let line = format!(
+                    "{}{}: unbound variable\n",
+                    self.assignment_error_prefix(),
+                    name
+                );
+                self.emit_assignment_diag(line);
+            }
+            self.shell_state.arithmetic_nounset_error.set(true);
+            self.raise_nounset_subscript_abort();
+            return None;
         }
         let message =
             crate::executor::arithmetic::take_arith_eval_error().map(|record| record.render());
@@ -1368,6 +1455,12 @@ impl Executor {
             let (base, append) = assignment_name_and_append(name);
             if matches!(base, "BASH_ALIASES" | "BASH_CMDS")
                 && !is_marked_var(&self.shell_state.env_vars, UNSET_DYNAMIC_VARS, base)
+                // A compound value reaches this door still wearing its
+                // COMPOUND_ASSIGNMENT_MARKER (the inner door strips it
+                // before routing), so a `(`-led test alone lets the
+                // marker-led compound slip into this scalar arm and bind
+                // the raw marked text as element [0] (rubash#3211).
+                && !value.starts_with(crate::executor::markers::COMPOUND_ASSIGNMENT_MARKER)
                 && !value.trim_start().starts_with('(')
             {
                 // ASS_APPEND rebuilds the bound string from the old
@@ -2178,6 +2271,10 @@ impl Executor {
                 // (Materialize the small scalar text: the checked eval
                 // takes &mut self, so the borrowed mirror cannot be held
                 // across it. This arm is scalar-only by construction.)
+                // The sum itself is intmax_t (variables.c:2936-2946
+                // `rval += lval; retval = itos (rval)`), so it wraps at
+                // INT64_MAX instead of storing the out-of-range i128
+                // decimal (rubash#3782).
                 let current = current.to_string();
                 let Some(current) = self.eval_integer_assignment_checked(&current) else {
                     return false;
@@ -2185,7 +2282,7 @@ impl Executor {
                 let Some(value) = self.eval_integer_assignment_checked(&value) else {
                     return false;
                 };
-                (current + value).to_string()
+                crate::executor::arithmetic::intmax_append_sum(current, value).to_string()
             } else {
                 append_scalar_value(current, &value)
             }

@@ -241,20 +241,14 @@ impl Executor {
         // #2642 (completing #2514): the only callers of this predicate
         // are the two describe faces (codegraph: describe_name_with_io,
         // describe_name_all_with_io), so gating it here gates exactly
-        // what the describe faces print and nothing else — dispatch,
-        // `enable`, `compgen -b` and `builtin env` keep the unified
-        // projection. `env` is rubash's one extension builtin
-        // (builtin_table::NON_GNU_BUILTIN_NAMES): GNU bash has no env
-        // builtin, so GNU `describe_command` (builtins/type.def:211)
-        // resolves it as a PATH file, and the row exists only because
-        // Windows has no /usr/bin/env. Off Windows the describe faces
-        // must therefore fall through to the PATH branch, exactly as
-        // #2514 ruled for the emulation-registered names; on Windows
-        // the builtin answer stands (pinned by
-        // issue2036_s2_introspection_windows).
-        if !cfg!(windows) && super::builtin_table::NON_GNU_BUILTIN_NAMES.contains(&name) {
-            return false;
-        }
+        // what the describe faces print and nothing else. GNU
+        // `describe_command` (builtins/type.def:211) resolves a name
+        // as a PATH file unless it is a builtin; `env` is not one
+        // (rubash#3951: it is an emulated external command), so
+        // `is_shell_builtin_name("env")` is false and the describe
+        // faces fall through to the PATH branch on every platform —
+        // the #2642 carve-out is now the general rule, and the
+        // NON_GNU set it gated on is gone with the extension row.
         is_shell_builtin_name(name)
             && !crate::builtins::enable::is_disabled(&self.shell_state.env_vars, name)
     }
@@ -323,6 +317,14 @@ impl Executor {
         // unset/empty PATH are exactly its arms.)
         if let Some(path_value) = self.shell_state.env_vars.get("PATH") {
             for dir in split_shell_path(path_value) {
+                // rubash#3826: GNU findcmd.c:544 — expand a `~`-leading
+                // PATH element at lookup time (unless POSIX mode), so
+                // `type -a` / `command -v -a` enumerate the expanded
+                // element.
+                let dir = crate::executor::path::expand_path_element_tilde(
+                    &dir,
+                    &self.shell_state.env_vars,
+                );
                 let candidate = shell_path_to_windows(&dir, &self.shell_state.env_vars).join(name);
                 // rubash#3147: the existence probe resolves against
                 // the SESSION cwd, exactly like the single-match walk
@@ -338,7 +340,13 @@ impl Executor {
                     candidate.clone(),
                     &self.shell_state.env_vars,
                 );
-                if anchored.is_file() {
+                // GNU type.def:381 describe_command: the -a enumeration
+                // uses user_command_matches (command, FS_EXEC_ONLY, ...)
+                // — only executable files are enumerated. The walk above
+                // is FS_EXEC_PREFERRED (correct for execution and the
+                // lenient faces), so the strict gate lives here, at the
+                // -a consumption point (rubash#3825).
+                if anchored.is_file() && crate::executor::path::is_executable_file(&anchored) {
                     paths.push(drop_exe_probe_suffix(
                         name,
                         shell_display_path(&candidate.to_string_lossy().replace('\\', "/")),

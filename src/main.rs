@@ -921,6 +921,17 @@ fn run_args(
                         );
                         return 2;
                     }
+                    // rubash#3909: startup arming of extdebug sets
+                    // bash_argv_initialized (variables.c:5640-5650)
+                    // before any positional binding — GNU's
+                    // run_shopt_alist (shell.c:576) arms the mode while
+                    // the arrays do not exist yet, so the flag is set
+                    // without pushing a frame. See
+                    // mark_bash_argv_initialized for why this lives at
+                    // the arming sites, not inside set_shopt_option.
+                    if option == "extdebug" && args[index] == "-O" {
+                        executor.mark_bash_argv_initialized();
+                    }
                     if option == "expand_aliases" {
                         alias_expansion_override = Some(args[index] == "-O");
                     }
@@ -1011,6 +1022,14 @@ fn run_args(
                         // and keeps the raw spelling.
                         executor.set_env("BASH_ARGV0", &entry_encode_argv_value(command_name));
                         executor.set_positional_params(entry_encode_argv(&args[index + 2..]));
+                        // rubash#3909: GNU bind_args (shell.c:1504-1529)
+                        // latches the bottom frame right after the
+                        // binding when extdebug is on; inside the
+                        // `Some(command_name)` arm on purpose — a
+                        // respawn child's `-c source` carries no $0
+                        // operand, no binding happens there, and the
+                        // inherited seed window must not be latched.
+                        executor.latch_bash_argv_after_startup_bind();
                     } else if executor.get_env("__RUBASH_SCRIPT_NAME").is_none() {
                         // GNU error.c:88-120 get_name_for_error: a `-c`
                         // string's BASH_SOURCE[0] is empty, so diagnostics
@@ -1138,6 +1157,9 @@ fn run_args(
     if read_from_stdin {
         // rubash#3105: `-s` positionals are raw argv words.
         executor.set_positional_params(entry_encode_argv(&std::mem::take(&mut stdin_positionals)));
+        // rubash#3909: bind_args latch (shell.c:1504-1529) — see the
+        // `-c` arm above.
+        executor.latch_bash_argv_after_startup_bind();
         return run_stdin_script_with_init(
             executor,
             init_file.as_deref(),
@@ -1414,6 +1436,8 @@ fn parse_long_options(
             // debugger builds on; that work upgrades this meaning in place).
             "debug" => {
                 executor.set_shopt_option("extdebug", true);
+                // rubash#3909: startup arming — see the -O arm above.
+                executor.mark_bash_argv_initialized();
             }
             // GNU shell.c:257: --debugger sets debugging_mode; the bashdb
             // starter runs at startup (start_debugger, shell.c:764/:795).
@@ -1778,6 +1802,9 @@ fn run_script_file_with_init(
         // with the same EX_NOINPUT. Windows reports ERROR_ACCESS_DENIED
         // when a directory is opened, so classify from metadata rather
         // than the errno of the failed read (rubash#262).
+        let is_dir = std::fs::metadata(&path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
         let (message, code) = match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_dir() => ("Is a directory".to_string(), 126),
             Ok(_) => ("Permission denied".to_string(), 126),
@@ -1793,12 +1820,27 @@ fn run_script_file_with_init(
         // GNU error.c:90-117 get_name_for_error: in non-interactive mode,
         // $0 (dollar_vars[0]) is used as the error prefix. When running
         // `${THIS_SH} ./errors1.sub`, $0 is the full path of the shell
-        // executable (e.g. /usr/local/bin/bash).
-        let shell_name = executor
-            .get_env("__RUBASH_SHELL_NAME")
-            .or_else(|| executor.get_env("BASH_ARGV0"))
-            .unwrap_or("bash");
-        eprintln!("{shell_name}: {script}: {message}");
+        // executable (e.g. /usr/local/bin/bash). The directory arm is the
+        // exception: open(2) succeeds on a directory, so dollar_vars[0]
+        // has already been rebound to the spelled script name when
+        // file_isdir reports EISDIR (shell.c:1604-1620) — `bash /`
+        // reports `/: /: Is a directory`, not `bash: /: Is a directory`.
+        // Every other failure happens at open, before the rebind, so the
+        // prolog stays the shell's own name.
+        if is_dir {
+            // The filename slot is the name GNU opened: the spelled
+            // operand, or the PATH-found path when the search supplied
+            // it (shell.c:1595-1597 replaces filename with
+            // path_filename).
+            let shown = path_found_name.as_deref().unwrap_or(script);
+            eprintln!("{script}: {shown}: {message}");
+        } else {
+            let shell_name = executor
+                .get_env("__RUBASH_SHELL_NAME")
+                .or_else(|| executor.get_env("BASH_ARGV0"))
+                .unwrap_or("bash");
+            eprintln!("{shell_name}: {script}: {message}");
+        }
         return code;
     };
     // GNU shell.c:1685-1692 + general.c:718-741 (check_binary_file): a
@@ -1806,12 +1848,17 @@ fn run_script_file_with_init(
     // interpreter specifier) contains NUL, or an ELF image, is refused with
     // "cannot execute binary file" and EX_BINARY_FILE (126).
     if check_binary_file(&bytes) {
-        // GNU shell.c:1685-1692 reports the script name plus resolved path
-        // before the diagnostic. The upstream invocation suite pipes this
-        // through a sed that strips everything up to the last colon-space,
-        // and the environment's sed performs no stripping, so rubash emits
-        // the post-normalization bare diagnostic directly.
-        eprintln!("cannot execute binary file");
+        // GNU shell.c:1685-1692 + error.c:74-117: dollar_vars[0] was
+        // rebound to the spelled script name right after the open
+        // (shell.c:1604-1609), so internal_error's prolog is the script
+        // name and the %s is the opened filename — `bash /bin/sh`
+        // reports `/bin/sh: /bin/sh: cannot execute binary file`,
+        // `bash ls` (PATH hit) reports `ls: /bin/ls: ...`. The
+        // invocation suite's `sed 's|^.*: ||'` normalizes the full
+        // form back to the bare diagnostic, so emitting the GNU prolog
+        // is correct under both harnesses.
+        let shown = path_found_name.as_deref().unwrap_or(script);
+        eprintln!("{script}: {shown}: cannot execute binary file");
         return 126;
     }
     // general.c:718 check_binary_file is GNU's ONLY script rejection gate
@@ -1855,6 +1902,9 @@ fn run_script_file_with_init(
     executor.inherit_process_stdin();
     // rubash#3105: script-file positionals are raw argv words.
     executor.set_positional_params(entry_encode_argv(args));
+    // rubash#3909: bind_args latch (shell.c:1504-1529) — see the `-c`
+    // arm above.
+    executor.latch_bash_argv_after_startup_bind();
     // shell.c:722 run_startup_files precedes the rcfile/script body
     // (rubash#487): `bash -l script` reads the profile chain first.
     // shell.c:795: start_debugger gates scripts too, before any body

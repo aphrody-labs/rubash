@@ -1,5 +1,8 @@
 use super::glob::{pathname_expand_word, PathnameExpansion};
 use super::*;
+use crate::executor::command_substitution_values::{
+    decode_protected_ifs_chars, protect_ifs_field_chars,
+};
 use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
 
 fn materialize_expanded_command_word(word: &str) -> String {
@@ -957,6 +960,61 @@ impl Executor {
                 status = 1;
             }
         }
+        // rubash#2761: a wordless command carrying a here-document /
+        // here-string never reached the stdin pre-expansion funnel
+        // (preexpand_command_stdin, the GNU do_redirections point the
+        // word-bearing path runs at command_execute.rs:583) — the
+        // empty-words arm returns through this function before word
+        // expansion, so the bodies were never expanded at all: no
+        // command substitution ran, no `:=` bound. Expand them here, at
+        // the same point in the null command's order: after the
+        // assignments above are bound (GNU expand_words runs before
+        // do_redirections, so a body sees the command's own assignments)
+        // and after the adjudicated assignment-error arms (#2369/#1542/
+        // #402) have had their chance to discard the command first —
+        // the expansion goes THROUGH that error handling, not around
+        // it. The funnel itself classifies the context (#2681): an fd-0
+        // heredoc forces the fork boundary
+        // (null_command_redirects_force_fork), so its effects run but
+        // do not persist; a numbered-fd body expands in the shell, so
+        // its bindings persist. The redirect application below then
+        // consumes the pre-expanded node, exactly as the word-bearing
+        // path does. Commands without stdin bodies skip this entirely —
+        // their behavior is unchanged.
+        let owned;
+        let cmd = if cmd.heredoc.is_some()
+            || !cmd.heredoc_redirects.is_empty()
+            || cmd.here_string.is_some()
+        {
+            let mut expanded = cmd.clone();
+            let heredoc_forked_exit = self.preexpand_command_stdin(&mut expanded);
+            // rubash#2763: take the main-shell latch NOW, before
+            // abort_on_expansion_errors can return early — otherwise a
+            // funsub `exit` latched by a main-shell body would leak into
+            // the next command.
+            let heredoc_main_shell_exit = self.current_shell_substitution_exit.take();
+            self.abort_on_expansion_errors()?;
+            if let Some(code) = heredoc_main_shell_exit {
+                // A `${ ...; exit N; }` inside a body that expands in
+                // the MAIN shell aborts the enclosing shell with N (same
+                // arm as the word-bearing path).
+                self.exit_code = code;
+                return Err(ExecuteError::ExitCode(code));
+            }
+            if let Some(code) = heredoc_forked_exit {
+                // A `${ ...; exit N; }` inside a body that expands in
+                // the FORKED child kills the child during
+                // do_redirections before the command runs, so the command
+                // never runs and N is its status; the script continues
+                // (same arm as the word-bearing path).
+                self.exit_code = code;
+                return Ok(());
+            }
+            owned = expanded;
+            &owned
+        } else {
+            cmd
+        };
         // GNU applies a null command's redirections too (execute_cmd.c
         // execute_null_command -> do_redirections), so `> $nope` under set
         // -u reports the unbound redirect word and ends the script — the
@@ -2683,7 +2741,13 @@ impl Executor {
                 }
             }
             if let Some(values) = self.array_at_word_values(word) {
-                if word_is_unquoted_array_list_expansion(word) {
+                // Same cooked-vs-raw quoting gap as the positional arms
+                // below: `''"${a[@]}"` cooks down to `${a[@]}`, which
+                // looks unquoted, but GNU never field-splits the quoted
+                // expansion — `''"${a[@]}"` with `a=''` is one empty
+                // argument (had_quoted_null, subst.c:12026-12035), not
+                // zero fields.
+                if !raw_word_is_quoted(raw) && word_is_unquoted_array_list_expansion(word) {
                     // rubash#3649: commit deferred substring-offset writes.
                     self.apply_pending_subscript_writes();
                     return field_split_array_values_with_ifs(
@@ -2769,19 +2833,31 @@ impl Executor {
         } else {
             self.quoted_positional_at_word_values_with_raw(word, raw, cmd.word_kinds.get(index))
         } {
-            // GNU quoted-$@ + quoted-null retention (see
-            // raw_quoted_at_word_has_quoted_null): `"$@"''` with no
-            // positional parameters is one empty argument, not zero
-            // (subst.c 12026-12035 had_quoted_null beats the discard).
-            if values.is_empty()
-                && raw.is_some_and(|raw| raw_quoted_at_word_has_quoted_null(raw, self))
-            {
+            // GNU subst.c:12026-12052 expand_word_internal tail for a
+            // quoted-$@ word whose expansion came back empty: one empty
+            // field survives iff
+            //   had_quoted_null || (quoted_dollar_at == 0 && PARTIALLY_QUOTED)
+            // — `"$@"''` is one empty argument (the '' flags a quoted
+            // null), `"$(true)""$@"` survives on the "$(true)" span's
+            // quoted null, while `"$(true)$@"` / `"$xxx$@"` / `$xxx"$@"`
+            // drop: the quoted $@ list is empty, quoted_dollar_at is set,
+            // and the span's other empty pieces are swallowed with it.
+            if values.is_empty() && raw.is_some_and(|raw| raw_empty_word_keeps_field(raw, self)) {
                 // rubash#3649: commit deferred substring-offset writes.
                 self.apply_pending_subscript_writes();
                 return vec![String::new()];
             }
-            if self.word_is_unquoted_positional_modified_list_expansion(word)
-                || self.word_is_unquoted_positional_list_expansion(word)
+            // The cooked word loses stripped quoting (`''"${@/*}"`
+            // cooks down to `${@/*}`), so the raw word is the quoting
+            // oracle: GNU field-splits the expansion's elements only
+            // when the `${...}` itself is unquoted
+            // (expand_word_internal, subst.c:11229 — the quoted path
+            // sets Q_DOUBLE_QUOTES and never splits). `''"${@/*}"`
+            // with one `X` positional is one empty argument, not
+            // zero words.
+            if !raw_word_is_quoted(raw)
+                && (self.word_is_unquoted_positional_modified_list_expansion(word)
+                    || self.word_is_unquoted_positional_list_expansion(word))
             {
                 // rubash#3649: commit deferred substring-offset writes.
                 self.apply_pending_subscript_writes();
@@ -2862,32 +2938,34 @@ impl Executor {
         // Quoted raws are safe too: the brace scanner is quote-aware, so
         // "{a,b}" stays literal while {a,b}'q' still splits.
         {
-            let braced = expand_braces_with_optional_raw(word, raw);
-            if braced.len() > 1 || (braced.len() == 1 && braced[0] != word) {
+            let braced = expand_braces_with_optional_raw_tagged(word, raw);
+            if braced.len() > 1 || (braced.len() == 1 && braced[0].text != word) {
                 let mut values = Vec::new();
-                for expanded in braced {
-                    // GNU braces.c brace_expand emits the empty-alternative
-                    // word, and expand_word_list_internal (subst.c:12026-
-                    // 12035) discards an unquoted null result the same way
-                    // it discards an unset variable's — `set -- {a,}` binds
-                    // one positional (rubash#337). Drop the empty member
-                    // HERE, at the brace-result assembly, so the comsum
-                    // word paths that share expand_command_word keep every
-                    // field they produce (the broad word-kind admission
-                    // cost the braces suite its command-substitution lines).
-                    // An escape-bearing sequence element (`{a..A}` yields
-                    // the `\` character) is never empty here, so it keeps
-                    // its field like GNU's quoted-null rule.
-                    // Sequence ({x..y}) elements are exempt: an
-                    // escape-bearing element — the `\` character in
-                    // {a..A} — expands empty but GNU KEEPS the field
-                    // (expand_word marks the word quoted; braces.tests
-                    // {a..A} keeps 33 args). Only plain ALTERNATIVE
-                    // members drop.
-                    if expanded.is_empty() && !word.contains("..") {
+                for product in braced {
+                    if product.text.is_empty() {
+                        // GNU braces.c brace_expand emits every member as
+                        // a word, and expand_word_list_internal
+                        // (subst.c:12026-12035) discards only an UNQUOTED
+                        // null result, the same way it discards an unset
+                        // variable's — `set -- {a,}` binds one positional
+                        // (rubash#337). Decide HERE, at the brace-result
+                        // assembly, so the comsub word paths that share
+                        // expand_command_word see the same fields (the
+                        // broad word-kind admission cost the braces suite
+                        // its command-substitution lines). Which empty
+                        // products are quoted nulls is a fact of their
+                        // origin, tagged by the brace layer
+                        // (BraceExpansionWord::quoted_null): a quoted
+                        // member (`{'',x}` keeps both words) and a
+                        // character sequence's backslash element
+                        // (braces.tests {a..A} keeps 33 args) keep their
+                        // field; only plain ALTERNATIVE members drop.
+                        if product.quoted_null {
+                            values.push(String::new());
+                        }
                         continue;
                     }
-                    values.extend(self.expand_command_word(cmd, index, &expanded, None));
+                    values.extend(self.expand_command_word(cmd, index, &product.text, None));
                 }
                 return values;
             }
@@ -3032,8 +3110,34 @@ impl Executor {
         } else {
             word
         };
+        // GNU expand_word_list_internal marks a declaration-builtin
+        // operand whose raw token is assignment-shaped with W_ASSIGNMENT
+        // (general.c:480 assignment()); such operands expand with
+        // PF_ASSIGNRHS — the same flag an `x=...` statement RHS carries —
+        // which both disables field splitting (command_words.rs keeps
+        // these operands unsplit already) and switches the "$@"/"${@}"
+        // element separator to ' ' (string_list_dollar_at tests
+        // PF_ASSIGNRHS first, subst.c:2975-3000). The matching word in an
+        // `export`/`readonly`/`declare`/`typeset`/`local` operand list
+        // must therefore see inside_assignment_rhs set during expansion:
+        // `typeset t="x$@y"` binds `xa,x b yy` under IFS=,, never
+        // `xa,x,b yy` (dollar-at-star8 a1/a2 family).
+        let decl_assignment_operand = matches!(
+            cmd.words.first().map(String::as_str),
+            Some("export" | "readonly" | "declare" | "typeset" | "local")
+        ) && cmd
+            .word_metadata
+            .get(index)
+            .is_some_and(|metadata| Self::raw_word_is_assignment(&metadata.raw));
+        let saved_assignment_rhs = self.inside_assignment_rhs.get();
+        if decl_assignment_operand {
+            self.inside_assignment_rhs.set(true);
+        }
         let saved_nonfatal = self.shell_state.arithmetic_nonfatal_error.replace(false);
         let expanded = self.expand_word_mut_with_context(word_to_expand, context);
+        if decl_assignment_operand {
+            self.inside_assignment_rhs.set(saved_assignment_rhs);
+        }
         // GNU subst.c:9955-9956: when parameter_brace_expand_length returns
         // a negative number (bad array subscript), the word expansion returns
         // &expand_wdesc_error and the word is dropped entirely (echo produces
@@ -3162,14 +3266,14 @@ impl Executor {
             std::borrow::Cow::Borrowed(expanded.as_str())
         };
         let expanded = expanded.as_ref();
-        if expanded.is_empty() && self.removes_unquoted_null_word(cmd, index) {
-            Vec::new()
-        } else if expanded.is_empty() && word_is_unquoted {
-            // The Variable-kind admission of removes_unquoted_null_word
-            // only models part of the GNU discard: a non-Variable
-            // unquoted word (`${v=$*}` with one empty positional) whose
-            // expansion is empty vanishes the same way.
-            Vec::new()
+        if expanded.is_empty() {
+            if cmd.words.first().is_some_and(|word| word == "[[")
+                || (!word_is_unquoted && self.empty_expanded_word_keeps_field(cmd, index, raw))
+            {
+                vec![String::new()]
+            } else {
+                Vec::new()
+            }
         } else if raw_word_contains_process_substitution(raw)
             && expanded_word_has_process_substitution(&expanded)
         {
@@ -3209,6 +3313,28 @@ impl Executor {
             )
         } else {
             vec![strip_ifs_protection_markers(&expanded).into_owned()]
+        }
+    }
+
+    /// expand_command_word tail for a word whose expansion came back
+    /// EMPTY — the GNU subst.c:12026-12052 keep/discard decision, decided
+    /// on the raw word text by raw_empty_word_keeps_field (quoted_dollar_at
+    /// / had_quoted_null / PARTIALLY_QUOTED). Synthetic words without raw
+    /// metadata fall back to the cooked-word null-removal rule.
+    fn empty_expanded_word_keeps_field(
+        &self,
+        cmd: &CommandNode,
+        index: usize,
+        raw: Option<&str>,
+    ) -> bool {
+        let raw = raw.or_else(|| {
+            cmd.word_metadata
+                .get(index)
+                .map(|metadata| metadata.raw.as_str())
+        });
+        match raw {
+            Some(raw) => raw_empty_word_keeps_field(raw, self),
+            None => !self.removes_unquoted_null_word(cmd, index),
         }
     }
 
@@ -3445,21 +3571,31 @@ impl Executor {
         if outer_double_quoted
             && !fragment_quoted
             && (alternate.contains("$@")
-                || alternate.contains("${@}")
+                || alternate.contains("${@")
                 // rubash#1993: `$*` in the alternate of a double-quoted
                 // ${param+word} carries the same quoted context — GNU
                 // joins it with IFS[0] into the ONE field the affixes
                 // glue to (`"${1+  $*  }"` is `  a b  c  ` for
                 // `set -- "a b" '' c` with IFS unset), it does not
-                // field-split into one word per parameter.
+                // field-split into one word per parameter. The prefix
+                // (not the exact `${*}`) admits modified forms too:
+                // `"${var-${*:1}}"` / `"${var-${*#}}"` are `$*`-family
+                // words whose quoted result joins on IFS[0]
+                // (param_expand passes `quoted` into the alternate,
+                // subst.c:7840-7860; star9 L45).
                 || alternate.contains("$*")
-                || alternate.contains("${*}"))
+                || alternate.contains("${*"))
         {
             // GNU subst.c:12026-12035 (expand_word_internal): the enclosing
             // double-quoted ${...} retains one empty field when the used
             // alternate expands to zero words (`"${foo-$@}"` with no
             // positional parameters yields `argv[1] = <>`, not zero args).
-            let values = self.expand_alternate_word_fragment(&format!("\"{alternate}\""));
+            // The fragment expands with outer_double_quoted=true: whitespace
+            // stays literal, list elements stay protected, and literal
+            // non-whitespace IFS bytes still delimit (subst.c:11950-11980) —
+            // no synthetic `"..."` wrap, which would wrongly protect the
+            // affixes' IFS chars as quoted text.
+            let values = self.expand_alternate_word_fragment(alternate, true);
             return Some(if values.is_empty() {
                 vec![String::new()]
             } else {
@@ -3694,7 +3830,7 @@ impl Executor {
         // double-quoted `${...}` keeps one empty field when the used
         // alternate expands to zero words (`"${foo-"$@"}"`, `"${foo:-${@}}"`,
         // `"${foo-$@$@}"` with no positional parameters).
-        let values = self.expand_alternate_word_fragment(alternate);
+        let values = self.expand_alternate_word_fragment(alternate, outer_double_quoted);
         if outer_double_quoted && values.is_empty() {
             return Some(vec![String::new()]);
         }
@@ -3850,11 +3986,26 @@ impl Executor {
         }
 
         // The outer `"${...}"` quoting carries into the alternate word
-        // (GNU param_expand passes `quoted` through), so the positional
-        // list must expand in a double-quoted context. An alternate that
-        // already carries its own quotes (`"$@"`) is scanned verbatim --
-        // wrapping it again (`""$@""`) would read the `$@` between the
-        // empty spans as a bare unquoted positional.
+        // (GNU param_expand passes `quoted` through). An alternate whose
+        // own text produces a list expansion (an unquoted `$@`/`$*` /
+        // `${name[@]}`, or a double-quoted piece holding one — the
+        // *qdollaratp flag of parameter_brace_expand_rhs, subst.c:8023-
+        // 8027) expands through the shared fragment emitter: its literal
+        // IFS bytes still delimit on non-whitespace IFS while whitespace
+        // stays literal and list elements stay protected
+        // (subst.c:11950-11980, :12098-12160).
+        if alternate_raw_has_list_expansion(alternate, true) {
+            let values = self.expand_alternate_word_fragment(alternate, true);
+            return Some(if values.is_empty() {
+                vec![String::new()]
+            } else {
+                values
+            });
+        }
+        // A list-less alternate that already carries its own quotes
+        // (`"$@"` is still possible as literal text inside single quotes)
+        // expands as the body of a double-quoted span: affix text attaches
+        // to the first/last positional word, one word per parameter.
         let synthetic_raw = if alternate.starts_with('"') && alternate.ends_with('"') {
             alternate.to_string()
         } else {
@@ -3874,6 +4025,7 @@ impl Executor {
     pub(in crate::executor) fn expand_alternate_word_fragment(
         &mut self,
         fragment: &str,
+        outer_double_quoted: bool,
     ) -> Vec<String> {
         // In POSIX mode, quotes inside a double-quoted parameter expansion
         // word are literal for quote-state purposes. Preserve that context
@@ -3897,15 +4049,648 @@ impl Executor {
             return Vec::new();
         };
 
-        let mut values = Vec::new();
+        // GNU carries the whole alternate as ONE word: `${0+  "$@"  }` is a
+        // single WORD_DESC whose rhs text is `  "$@"  `, so the whitespace
+        // before/after/between the fragment's words is affix text that glues
+        // to the boundary fields (subst.c:7840-7860 param_expand feeds the
+        // rhs through the ordinary word machinery; expand_word_list_internal
+        // then splits only unquoted-IFS-whitespace runs). Re-lexing the
+        // fragment as a command drops exactly those separators: `  "$@"  `
+        // tokenizes to a bare `"$@"`. Recover each separator as the source
+        // gap between consecutive word raws, expand every word, then merge
+        // fields across word boundaries — a separator character is a field
+        // delimiter only when it is ambient-IFS whitespace (inside a
+        // double-quoted outer word nothing splits).
+        let mut raws: Vec<String> = Vec::new();
         for index in 1..cmd.words.len() {
             let raw = cmd
                 .word_metadata
                 .get(index)
                 .map(|metadata| metadata.raw.as_str());
-            values.extend(self.expand_command_word(cmd, index, &cmd.words[index], raw));
+            raws.push(raw.unwrap_or_default().to_string());
         }
-        values
+
+        let mut separators: Vec<String> = Vec::with_capacity(raws.len() + 1);
+        let mut cursor = 0usize;
+        let mut located = true;
+        for raw in &raws {
+            match fragment[cursor..].find(raw.as_str()) {
+                Some(offset) => {
+                    separators.push(fragment[cursor..cursor + offset].to_string());
+                    cursor += offset + raw.len();
+                }
+                None => {
+                    located = false;
+                    break;
+                }
+            }
+        }
+        if !located {
+            // Defensive fallback: a raw that does not appear verbatim in the
+            // fragment keeps the pre-existing flat concatenation.
+            return (1..cmd.words.len())
+                .flat_map(|index| {
+                    let raw = cmd.word_metadata.get(index).map(|m| m.raw.as_str());
+                    self.expand_command_word(cmd, index, &cmd.words[index], raw)
+                })
+                .collect();
+        }
+        separators.push(fragment[cursor..].to_string());
+        let ifs_owned = self.shell_state.env_vars.get("IFS").cloned();
+        let ifs = ifs_owned.as_deref();
+        // GNU expand_string_for_rhs expands the alternate under
+        // W_EXPANDRHS|W_NOSPLIT2 (subst.c:4462-4501): literal IFS bytes
+        // stay raw through expansion — add_ifs_character CTLESC-protects
+        // an IFS char only outside the rhs modes (subst.c:11950-11980) —
+        // so a literal `:` inside `x:"$@"` splits on IFS=: just like an
+        // unquoted separator does. The per-word fields from
+        // expand_command_word arrive dequoted with every protection
+        // carrier stripped, so a field-level merge cannot see which bytes
+        // may split. Re-segment each raw at its top-level quote toggles
+        // instead: unquoted pieces split on every ambient IFS char,
+        // quoted pieces stay whole, and unquoted list expansions follow
+        // the string_list_pos_params PF_ASSIGNRHS join rules
+        // (subst.c:7840-7860, :3020-3072). A fully double-quoted outer
+        // word suppresses splitting unless the alternate produced a
+        // dollar-at list (*qdollaratp, parameter_brace_expand_rhs
+        // subst.c:8023-8027).
+        // The deferred non-whitespace-IFS split of expand_word_internal
+        // fires only when the word's expansion produced a `$@`-class list
+        // (has_dollar_at; subst.c:12098-12160). Under an unquoted outer
+        // word ordinary field splitting always applies, so literal IFS
+        // chars delimit unconditionally; under a quoted outer without a
+        // dollar_at the whole rhs is one field and the chars are literal
+        // — including `'`s, which are ordinary characters inside the
+        // enclosing `"${...}"` rather than quote openers.
+        let emit_delims = !outer_double_quoted
+            || raws
+                .iter()
+                .any(|raw| alternate_raw_has_dollar_at(raw, true));
+        let ifs_chars = ifs.unwrap_or(" \t\n");
+        // Word-level W_NOSPLIT2 rejoin (subst.c:12123-12148): under an
+        // unquoted outer word, a set IFS that neither is empty nor starts
+        // with ' ', an expansion producing an unquoted `$@`-class list
+        // (has_dollar_at without quoted_dollar_at) makes the WHOLE word
+        // split on the IFS chars and rejoin with ' ' — one field. A
+        // `"$@"` (quoted_dollar_at) or a `$*`/`[*]`-only rhs take the
+        // ordinary deferred split instead, and a ` ` or empty IFS head
+        // falls through to the caller's regular split.
+        if !outer_double_quoted && !ifs_chars.is_empty() && !ifs_chars.starts_with(' ') {
+            let has_quoted_at = raws.iter().any(|raw| {
+                segment_alternate_raw(raw, false)
+                    .iter()
+                    .any(|piece| match piece {
+                        AlternatePiece::Quoted(text) => {
+                            text.starts_with('"')
+                                && text.len() >= 2
+                                && unquoted_alternate_text_has_dollar_at(
+                                    &text[1..text.len() - 1],
+                                    true,
+                                )
+                        }
+                        _ => false,
+                    })
+            });
+            let has_unquoted_at = raws.iter().any(|raw| {
+                segment_alternate_raw(raw, false)
+                    .iter()
+                    .any(|piece| match piece {
+                        AlternatePiece::Unquoted(text) => {
+                            unquoted_alternate_text_has_dollar_at(text, false)
+                        }
+                        _ => false,
+                    })
+            });
+            if has_unquoted_at && !has_quoted_at {
+                return vec![self.fuse_alternate_word_fields(&raws, &separators, ifs_chars)];
+            }
+        }
+        let mut emits = Vec::new();
+        Self::emit_alternate_separator(
+            &separators[0],
+            ifs_chars,
+            outer_double_quoted,
+            emit_delims,
+            &mut emits,
+        );
+        for (index, raw) in raws.iter().enumerate() {
+            self.emit_alternate_fragment_word(
+                raw,
+                ifs,
+                outer_double_quoted,
+                emit_delims,
+                &mut emits,
+            );
+            Self::emit_alternate_separator(
+                &separators[index + 1],
+                ifs_chars,
+                outer_double_quoted,
+                emit_delims,
+                &mut emits,
+            );
+        }
+        merge_alternate_emits(emits)
+    }
+
+    /// Field values of an embedded `"pre${name OP rhs}post"` alternate
+    /// whose rhs carries a `$@`-class list source (GNU
+    /// parameter_brace_expand_rhs, subst.c:7960-8070): when the operator's
+    /// condition selects the rhs word, its expansion fields splice into the
+    /// enclosing quoted word with affixes on the first/last field;
+    /// otherwise the operand contributes the parameter's value (or empty)
+    /// as one field.
+    pub(in crate::executor) fn embedded_braced_alternate_fields(
+        &mut self,
+        inner: &str,
+    ) -> Option<Vec<String>> {
+        let (name, rhs, use_when_set, require_non_empty) = embedded_braced_alternate_parts(inner)?;
+        let resolved = self.resolved_variable_name(name)?;
+        let value = self.shell_state.env_vars.get(&resolved);
+        let use_rhs = if use_when_set {
+            value.is_some_and(|v| !require_non_empty || !v.is_empty())
+        } else {
+            value.map_or(true, |v| require_non_empty && v.is_empty())
+        };
+        if use_rhs {
+            let fields = self.expand_alternate_word_fragment(rhs, true);
+            // The enclosing `"${...}"` is a quoted word: when the rhs
+            // expansion produces nothing (an empty `$@` list, an empty
+            // command substitution) the word still contributes one
+            // empty field — GNU's had_quoted_null (subst.c:12026-12035).
+            Some(if fields.is_empty() {
+                vec![String::new()]
+            } else {
+                fields
+            })
+        } else {
+            Some(vec![value.cloned().unwrap_or_default()])
+        }
+    }
+
+    /// Expand one unquoted run. Under a double-quoted outer word the run
+    /// is interior text of the enclosing `"${...}"`: whitespace is
+    /// literal, `'` is an ordinary character, `\` only escapes the
+    /// dquote set, and expansions do not split — so expand it as the
+    /// body of a double-quoted span (subst.c:11950-11980).
+    fn expand_alternate_run(&mut self, piece: &str, quoted_outer: bool) -> Vec<String> {
+        if !quoted_outer {
+            return self.expand_alternate_piece(piece);
+        }
+        self.expand_alternate_piece(&format!("\"{piece}\""))
+    }
+
+    /// Re-lex one alternate-fragment piece (`x:`, `"$@"`, `'a:b'`, a run of
+    /// unquoted text between IFS delimiters) as a single command word and
+    /// expand it through the ordinary word machinery.
+    fn expand_alternate_piece(&mut self, piece: &str) -> Vec<String> {
+        let source = format!("__rubash_parameter_alternate__ {piece}");
+        let tokens = crate::lexer::tokenize(&source);
+        let ast = crate::parser::parse(&tokens);
+        let Some(pcmd) = ast.commands.first() else {
+            return vec![piece.to_string()];
+        };
+        if pcmd.words.len() < 2 {
+            return vec![piece.to_string()];
+        }
+        let raw = pcmd.word_metadata.get(1).map(|m| m.raw.as_str());
+        self.expand_command_word(pcmd, 1, &pcmd.words[1], raw)
+    }
+
+    /// Emit one fragment word's expansion into the merge stream.
+    /// `emit_delims` is the word-level decision whether literal
+    /// non-whitespace IFS chars delimit at all (always under an unquoted
+    /// outer; under a quoted outer only when a `$@`-class expansion set
+    /// has_dollar_at, subst.c:12098-12160).
+    fn emit_alternate_fragment_word(
+        &mut self,
+        raw: &str,
+        ifs: Option<&str>,
+        outer_double_quoted: bool,
+        emit_delims: bool,
+        emits: &mut Vec<AlternateEmit>,
+    ) {
+        let ifs_chars = ifs.unwrap_or(" \t\n");
+        // GNU expand_word_internal (subst.c:12098-12160): under a set
+        // non-empty IFS whose first char is not ' ', an unquoted
+        // dollar-at in the rhs joins the whole word back into ONE field
+        // (list_string on the IFS chars, rejoined with ' '), while a
+        // set IFS starting with ' ' keeps the string for the outer
+        // splitter where the elements stay escaped. A double-quoted
+        // outer word propagates `quoted` (param_expand subst.c:7840-
+        // 7860) so its unquoted $@ yields one protected field per
+        // positional instead of the unquoted rejoin.
+        // Elements stay protected only for genuinely quoted contexts —
+        // the enclosing `"${...}"` propagates `quoted` (param_expand
+        // subst.c:7840-7860), and a `"..."` interior piece is processed
+        // with protected_lists=true by its own call below. Under an
+        // unquoted outer word every expansion byte is unprotected, so a
+        // ` `-first IFS still splits element internals (subst.c:12153).
+        let protected_lists = outer_double_quoted;
+        for piece in segment_alternate_raw(raw, outer_double_quoted) {
+            match piece {
+                AlternatePiece::Quoted(text) => {
+                    // A double-quoted piece carrying a list expansion is a
+                    // qdollarat word: GNU still splits its literal IFS
+                    // bytes ("x:$@" inside "${u- "x:$@" }" splits at ':'),
+                    // while the elements stay protected. Process the inner
+                    // text like an unquoted segment in protected mode.
+                    // (`'` can only head a Quoted piece under an unquoted
+                    // outer — inside `"${...}"` it is an ordinary
+                    // character and never reaches this branch.)
+                    let inner = if text.len() >= 2 {
+                        &text[1..text.len() - 1]
+                    } else {
+                        ""
+                    };
+                    if outer_double_quoted
+                        && text.starts_with('"')
+                        && unquoted_alternate_text_has_list(inner, true)
+                    {
+                        self.emit_unquoted_alternate_segment(
+                            inner,
+                            ifs_chars,
+                            true,
+                            outer_double_quoted,
+                            emit_delims,
+                            emits,
+                        );
+                    } else {
+                        for (index, field) in
+                            self.expand_alternate_piece(&text).into_iter().enumerate()
+                        {
+                            if index > 0 {
+                                emits.push(AlternateEmit::WordBoundary);
+                            }
+                            emits.push(AlternateEmit::Text(field));
+                        }
+                    }
+                }
+                AlternatePiece::Unquoted(text) => {
+                    self.emit_unquoted_alternate_segment(
+                        &text,
+                        ifs_chars,
+                        protected_lists,
+                        outer_double_quoted,
+                        emit_delims,
+                        emits,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scan an unquoted fragment piece: literal runs expand through the
+    /// word machinery, ambient-IFS whitespace runs collapse to one
+    /// boundary, non-whitespace IFS chars each delimit (empty fields
+    /// between adjacent delimiters, like `a::b`), and unquoted list
+    /// expansions emit per-element fields. `quoted_outer` suppresses
+    /// whitespace splitting entirely and expands runs under an IFS
+    /// narrowed to its non-whitespace members — the enclosing double
+    /// quotes keep every whitespace byte literal while the rhs literal
+    /// IFS chars still delimit (subst.c:11950-11980, :12098-12160).
+    fn emit_unquoted_alternate_segment(
+        &mut self,
+        text: &str,
+        ifs_chars: &str,
+        protected_lists: bool,
+        quoted_outer: bool,
+        emit_delims: bool,
+        emits: &mut Vec<AlternateEmit>,
+    ) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut run = String::new();
+        let mut index = 0usize;
+        macro_rules! flush_run {
+            () => {
+                if !run.is_empty() {
+                    let piece = std::mem::take(&mut run);
+                    let fields = self.expand_alternate_run(&piece, quoted_outer);
+                    if quoted_outer {
+                        for (i, field) in fields.into_iter().enumerate() {
+                            if i > 0 {
+                                emits.push(AlternateEmit::WordBoundary);
+                            }
+                            emits.push(AlternateEmit::Text(field));
+                        }
+                    } else {
+                        emit_unquoted_alternate_fields(fields, ifs_chars, emits);
+                    }
+                }
+            };
+        }
+        while index < chars.len() {
+            match chars[index] {
+                '\\' => {
+                    run.push('\\');
+                    if index + 1 < chars.len() {
+                        run.push(chars[index + 1]);
+                    }
+                    index += 2;
+                }
+                '\'' if quoted_outer => {
+                    // Inside the enclosing `"${...}"` a `'` is an
+                    // ordinary byte, not a quote: emit it literally so
+                    // the run's re-lexed expansion cannot consume it as
+                    // a quote opener (`x:'a:b'` keeps its apostrophes).
+                    flush_run!();
+                    emits.push(AlternateEmit::Text("'".to_string()));
+                    index += 1;
+                }
+                ch if ch.is_whitespace() && ifs_chars.contains(ch) => {
+                    if quoted_outer {
+                        run.push(ch);
+                    } else {
+                        flush_run!();
+                        emits.push(AlternateEmit::WordBoundary);
+                    }
+                    index += 1;
+                }
+                ch if !ch.is_whitespace() && ifs_chars.contains(ch) => {
+                    if emit_delims {
+                        flush_run!();
+                        emits.push(AlternateEmit::DelimBoundary);
+                    } else {
+                        // No dollar_at: the deferred split never fires and
+                        // the char stays literal (subst.c:12098-12160).
+                        run.push(ch);
+                    }
+                    index += 1;
+                }
+                ch => {
+                    if let Some(end) = unquoted_list_token_end(&chars, index) {
+                        flush_run!();
+                        // Same beyond-the-buffer sentinel the skip helpers
+                        // return for unclosed spans (see the #743/#875 clamps
+                        // in mark_literal_ifs_chars): an unclosed `${...`
+                        // token's end lands one past the buffer.
+                        let end = end.min(chars.len());
+                        let token: String = chars[index..end].iter().collect();
+                        if protected_lists {
+                            for (i, field) in self
+                                .alternate_list_fields(&token, ifs_chars, true)
+                                .into_iter()
+                                .enumerate()
+                            {
+                                if i > 0 {
+                                    emits.push(AlternateEmit::WordBoundary);
+                                }
+                                emits.push(AlternateEmit::Text(field));
+                            }
+                        } else if !quoted_outer {
+                            let mut fields = self.alternate_list_fields(&token, ifs_chars, false);
+                            if fields.is_empty() {
+                                fields = self.expand_alternate_piece(&token);
+                            }
+                            emit_unquoted_alternate_fields(fields, ifs_chars, emits);
+                        } else {
+                            for (i, field) in
+                                self.expand_alternate_piece(&token).into_iter().enumerate()
+                            {
+                                if i > 0 {
+                                    emits.push(AlternateEmit::WordBoundary);
+                                }
+                                emits.push(AlternateEmit::Text(field));
+                            }
+                        }
+                        index = end;
+                    } else {
+                        let end = if ch == '$'
+                            && index + 1 < chars.len()
+                            && matches!(chars[index + 1], '(' | '{' | '`')
+                        {
+                            balanced_alternate_span_end(&chars, index)
+                        } else if ch == '`' {
+                            balanced_alternate_span_end(&chars, index)
+                        } else {
+                            index + 1
+                        };
+                        for ch in &chars[index..end.min(chars.len())] {
+                            run.push(*ch);
+                        }
+                        index = end;
+                    }
+                }
+            }
+        }
+        flush_run!();
+    }
+
+    /// The element list an unquoted rhs list-expansion token contributes.
+    fn alternate_list_fields(&mut self, token: &str, ifs_chars: &str, quoted: bool) -> Vec<String> {
+        let ifs_first = ifs_chars.chars().next().unwrap_or(' ').to_string();
+        match token {
+            "$@" | "${@}" => self.shell_state.positional_window_cloned(),
+            "$*" | "${*}" => {
+                if quoted {
+                    // Quoted `"$*"` joins with $IFS's first char; a
+                    // set-but-null IFS concatenates (ifs_is_null,
+                    // subst.c:3031-3040 list_string joiner), an unset
+                    // IFS falls back to ' ' (ifs_chars is " \t\n" here).
+                    let joiner = if ifs_chars.is_empty() {
+                        String::new()
+                    } else {
+                        ifs_first.clone()
+                    };
+                    vec![self.shell_state.positional_window().join(&joiner)]
+                } else if ifs_chars.is_empty() {
+                    // Unquoted `$*` under a set-but-null IFS carries
+                    // W_SPLITSPACE (subst.c:10207; accumulated at
+                    // :11535, whole-word split on ' ' at :12103-12107):
+                    // element text is protected so each positional is
+                    // its own field — observably the $@ element list.
+                    self.shell_state.positional_window_cloned()
+                } else {
+                    vec![self.shell_state.positional_window().join(&ifs_first)]
+                }
+            }
+            _ => {
+                if let Some(base) = token
+                    .strip_prefix("${")
+                    .and_then(|inner| inner.strip_suffix('}'))
+                    .and_then(|inner| {
+                        inner
+                            .strip_suffix("[@]")
+                            .or_else(|| inner.strip_suffix("[*]"))
+                    })
+                {
+                    let star = token.ends_with("[*]}");
+                    if let Some(storage) = self.parameter_array_storage(base) {
+                        let values: Vec<String> =
+                            if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                                assoc_hash_ordered_values(
+                                    &storage,
+                                    assoc_nbuckets(&self.shell_state.env_vars, base),
+                                )
+                            } else {
+                                array_values(&storage)
+                            }
+                            .into_iter()
+                            .map(normalize_array_expanded_value)
+                            .collect();
+                        return if star {
+                            if quoted {
+                                // Quoted `"${name[*]}"` joins with
+                                // $IFS's first char; a set-but-null IFS
+                                // concatenates (ifs_is_null,
+                                // subst.c:3031-3040).
+                                let joiner = if ifs_chars.is_empty() {
+                                    String::new()
+                                } else {
+                                    ifs_first.clone()
+                                };
+                                vec![values.join(&joiner)]
+                            } else if ifs_chars.is_empty() {
+                                // Same W_SPLITSPACE as unquoted `$*`
+                                // (subst.c:10207): per-element fields.
+                                values
+                            } else {
+                                vec![values.join(&ifs_first)]
+                            }
+                        } else {
+                            values
+                        };
+                    }
+                    return Vec::new();
+                }
+                // A `${name[@]<op>}` token with slice / pattern /
+                // case-modifier suffixes is not a bare list reference:
+                // expand it through the ordinary word machinery in the
+                // context it was scanned from. A token inside a `"..."`
+                // piece — or unquoted text under a `"${...}"` outer,
+                // where param_expand's `quoted` propagates
+                // (subst.c:7840-7860) — expands like `"${name[@]<op>}"`,
+                // keeping empty elements and per-element fields; an
+                // unquoted token expands bare. A token carrying its own
+                // `"` cannot be re-wrapped and keeps the bare expansion.
+                if quoted && !token.contains('"') {
+                    self.expand_alternate_piece(&format!("\"{token}\""))
+                } else {
+                    self.expand_alternate_piece(token)
+                }
+            }
+        }
+    }
+
+    /// The subst.c:12123-12148 rejoin for a whole unquoted alternate rhs
+    /// carrying an unquoted `$@`-class list under a set IFS that neither
+    /// is empty nor starts with ' ': assemble the entire word's
+    /// expansion text — quote-produced bytes IFS-protected like GNU's
+    /// CTLESC so a `"a:b"` keeps its `:` — then split once on the IFS
+    /// chars and rejoin with ' ', yielding one field.
+    fn fuse_alternate_word_fields(
+        &mut self,
+        raws: &[String],
+        separators: &[String],
+        ifs_chars: &str,
+    ) -> String {
+        let ifs_first = ifs_chars.chars().next().unwrap_or(' ').to_string();
+        let mut assembled = String::new();
+        assembled.push_str(&separators[0]);
+        for (index, raw) in raws.iter().enumerate() {
+            for piece in segment_alternate_raw(raw, false) {
+                match piece {
+                    AlternatePiece::Quoted(text) => {
+                        for field in self.expand_alternate_piece(&text) {
+                            assembled.push_str(&protect_ifs_field_chars(&field, Some(ifs_chars)));
+                        }
+                    }
+                    AlternatePiece::Unquoted(text) => {
+                        self.fuse_alternate_unquoted_text(
+                            &text,
+                            &ifs_first,
+                            ifs_chars,
+                            &mut assembled,
+                        );
+                    }
+                }
+            }
+            assembled.push_str(&separators[index + 1]);
+        }
+        let fields = field_split_values_with_ifs(&assembled, Some(ifs_chars));
+        decode_protected_ifs_chars(&fields.join(" "))
+    }
+
+    /// Append one unquoted piece's expansion text to the rejoin buffer:
+    /// `\<char>` stays protected (CTLESC), expansions land raw with
+    /// element fields rejoined on the IFS first char like GNU's
+    /// string_list_dollar_at PF_ASSIGNRHS join (subst.c:3020-3072).
+    fn fuse_alternate_unquoted_text(
+        &mut self,
+        text: &str,
+        ifs_first: &str,
+        ifs_chars: &str,
+        assembled: &mut String,
+    ) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut run = String::new();
+        let mut index = 0usize;
+        macro_rules! flush_run {
+            () => {
+                if !run.is_empty() {
+                    let piece = std::mem::take(&mut run);
+                    assembled.push_str(&self.expand_alternate_run(&piece, false).join(ifs_first));
+                }
+            };
+        }
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '\\' {
+                flush_run!();
+                assembled.push(crate::executor::markers::IFS_GLUE);
+                if index + 1 < chars.len() {
+                    assembled.push(chars[index + 1]);
+                }
+                index += 2;
+            } else if let Some(end) = unquoted_list_token_end(&chars, index) {
+                flush_run!();
+                let token: String = chars[index..end.min(chars.len())].iter().collect();
+                let mut fields = self.alternate_list_fields(&token, ifs_chars, false);
+                if fields.is_empty() {
+                    fields = self.expand_alternate_piece(&token);
+                }
+                assembled.push_str(&fields.join(ifs_first));
+                index = end;
+            } else if ch == '$'
+                && index + 1 < chars.len()
+                && matches!(chars[index + 1], '(' | '{' | '`')
+                || ch == '`'
+            {
+                flush_run!();
+                let end = balanced_alternate_span_end(&chars, index);
+                let token: String = chars[index..end.min(chars.len())].iter().collect();
+                assembled.push_str(&self.expand_alternate_piece(&token).join(ifs_first));
+                index = end;
+            } else {
+                run.push(ch);
+                index += 1;
+            }
+        }
+        flush_run!();
+    }
+
+    /// Separator text between fragment words follows the same rules as
+    /// unquoted piece text (subst.c:11950-11980): an ambient-IFS
+    /// whitespace char collapses to a boundary, a non-whitespace IFS
+    /// char delimits, everything else is literal. Inside a double-quoted
+    /// outer word every whitespace byte is literal, and non-whitespace
+    /// IFS chars delimit only when emit_delims (a dollar_at fired the
+    /// deferred split).
+    fn emit_alternate_separator(
+        separator: &str,
+        ifs_chars: &str,
+        quoted_outer: bool,
+        emit_delims: bool,
+        emits: &mut Vec<AlternateEmit>,
+    ) {
+        for ch in separator.chars() {
+            if ch.is_whitespace() && ifs_chars.contains(ch) && !quoted_outer {
+                emits.push(AlternateEmit::WordBoundary);
+            } else if !ch.is_whitespace() && ifs_chars.contains(ch) && emit_delims {
+                emits.push(AlternateEmit::DelimBoundary);
+            } else {
+                emits.push(AlternateEmit::Text(ch.to_string()));
+            }
+        }
     }
 
     // Whole-word x1d-marked braced alternates whose raw word has no outer
@@ -4630,13 +5415,64 @@ fn expanded_word_has_process_substitution(word: &str) -> bool {
         .is_empty()
 }
 
+/// One brace-expansion product for command-word assembly: its text
+/// (after the quote-removal strip expand_braces_with_optional_raw
+/// applies) plus whether an empty text is nevertheless a real word.
+pub(in crate::executor) struct BraceExpansionWord {
+    pub text: String,
+    /// True when `text` is empty but the word exists: quote removal
+    /// reduced a non-empty product to nothing (a quoted member such as
+    /// `''`), or the brace layer flagged the product as a character
+    /// sequence's backslash element (BraceProduct::sequence_null).
+    /// GNU keeps such quoted nulls as fields; only bare alternative
+    /// nulls (`{a,}`) are discarded as unquoted null results
+    /// (rubash#337).
+    pub quoted_null: bool,
+}
+
+fn tag_brace_products(
+    products: Vec<crate::expand::braces::BraceProduct>,
+    strip: bool,
+) -> Vec<BraceExpansionWord> {
+    products
+        .into_iter()
+        .map(|product| {
+            let text = if strip {
+                crate::lexer::remove_shell_quotes(&product.text)
+            } else {
+                product.text.clone()
+            };
+            let quoted_null =
+                text.is_empty() && (!product.text.is_empty() || product.sequence_null);
+            BraceExpansionWord { text, quoted_null }
+        })
+        .collect()
+}
+
+fn untagged_brace_word(text: String) -> BraceExpansionWord {
+    BraceExpansionWord {
+        text,
+        quoted_null: false,
+    }
+}
+
 pub(in crate::executor) fn expand_braces_with_optional_raw(
     word: &str,
     raw: Option<&str>,
 ) -> Vec<String> {
+    expand_braces_with_optional_raw_tagged(word, raw)
+        .into_iter()
+        .map(|product| product.text)
+        .collect()
+}
+
+pub(in crate::executor) fn expand_braces_with_optional_raw_tagged(
+    word: &str,
+    raw: Option<&str>,
+) -> Vec<BraceExpansionWord> {
     if let Some(raw) = raw {
         if raw != word {
-            let braced = crate::expand::braces::expand_braces(raw);
+            let braced = crate::expand::braces::expand_braces_tagged(raw);
             // GNU braces.c brace_expand is a textual rewrite of the word;
             // when it returns the raw word byte-identical there IS no
             // expansion product, so the pass must be transparent: the word
@@ -4651,30 +5487,26 @@ pub(in crate::executor) fn expand_braces_with_optional_raw(
             // group (`'{}'`, `{y}`) makes brace expansion a no-op exactly
             // like an escaped one; only real expansion products (len > 1,
             // or a rewritten single word) take the strip below.
-            if braced.len() == 1 && braced[0] == raw {
-                return vec![word.to_string()];
+            if braced.len() == 1 && braced[0].text == raw {
+                return vec![untagged_brace_word(word.to_string())];
             }
             if braced.len() > 1 || word_contains_brace_group(raw) {
                 // The raw-based expansion kept backslash escapes that the
                 // lexer would otherwise strip. Strip them so escaped chars
                 // render literally, matching GNU bash, while real brace
                 // expansion still yields multiple words.
-                let mut stripped: Vec<String> = Vec::new();
-                for item in braced {
-                    stripped.push(crate::lexer::remove_shell_quotes(&item));
-                }
-                return stripped;
+                return tag_brace_products(braced, true);
             }
             // When raw has escaped braces that prevent expansion,
             // but word has lost the escapes and would expand, preserve the
             // raw result to avoid incorrect brace expansion.
             if crate::expand::braces::expand_braces(word).len() > 1 {
-                return vec![word.to_string()];
+                return vec![untagged_brace_word(word.to_string())];
             }
         }
     }
 
-    let braced = crate::expand::braces::expand_braces(word);
+    let braced = crate::expand::braces::expand_braces_tagged(word);
     // GNU bash runs brace expansion on the raw word (backslash escapes
     // intact) and applies quote removal to each result word afterwards
     // (subst.c brace expansion runs before the quote-removal pass on the
@@ -4682,19 +5514,13 @@ pub(in crate::executor) fn expand_braces_with_optional_raw(
     // removal, so strip the escapes here: {a,b\,c} must yield b,c and
     // \{a,b} must yield {a,b} once no expansion is possible.
     if braced.len() > 1 {
-        braced
-            .into_iter()
-            .map(|item| crate::lexer::remove_shell_quotes(&item))
-            .collect()
+        tag_brace_products(braced, true)
     } else if word_contains_brace_group(word) {
         // A brace group can be syntactically present without producing
         // multiple words; quote removal still applies to its escaped text.
-        braced
-            .into_iter()
-            .map(|item| crate::lexer::remove_shell_quotes(&item))
-            .collect()
+        tag_brace_products(braced, true)
     } else {
-        braced
+        tag_brace_products(braced, false)
     }
 }
 
@@ -4903,18 +5729,24 @@ pub(in crate::executor) fn raw_word_is_fully_single_quoted(raw: Option<&str>) ->
     !in_single
 }
 
-/// A quoted `$@`/`$*` word whose expansion is empty still yields one
-/// empty argument when the raw word also contains a quoted-null source:
-/// an empty ''/"" span, or a quoted pure reference that expands empty
-/// (GNU expand_word_internal: the ''/"" cases add CTLNUL and set
-/// had_quoted_null at 11841-11847 / 11940-11944, and the final
-/// 12026-12035 keeps a had_quoted_null word as a QUOTED_NULL argument
-/// even when quoted_dollar_at discarded the "$@" half -- quote4.sub
-/// `n "$@"''` with no positional parameters is 1, not 0).
-fn raw_quoted_at_word_has_quoted_null(raw: &str, executor: &Executor) -> bool {
+/// Does the raw word contain a quoted-null contributor: an empty
+/// `''`/`""`/`$''` span, or a quoted pure reference that expands empty?
+/// GNU retains an all-empty expansion as one empty argument whenever the
+/// word saw one: expand_word_internal's discard branch is
+/// `had_quoted_null || (quoted_dollar_at == 0 && PARTIALLY_QUOTED)`
+/// (subst.c:12026-12035; the ''/"" cases add CTLNUL and set
+/// had_quoted_null at 11841-11847 / 11940-11944). Reaching this check
+/// already means the word carried a positional-`@`-list source whose
+/// expansion came back empty, so no @-recognition is needed here:
+/// `''"${a[@]}"`, `""${@/*}"` and `"$x""${@#p}"` (x unset) all retain
+/// `<>` — quote4.sub `n "$@"''` with no positional parameters is 1,
+/// not 0.
+pub(in crate::executor) fn raw_quoted_at_word_has_quoted_null(
+    raw: &str,
+    executor: &Executor,
+) -> bool {
     let chars: Vec<char> = raw.chars().collect();
     let mut index = 0usize;
-    let mut saw_quoted_at = false;
     let mut saw_quoted_null = false;
     while index < chars.len() {
         match chars[index] {
@@ -4942,26 +5774,12 @@ fn raw_quoted_at_word_has_quoted_null(raw: &str, executor: &Executor) -> bool {
                     content.push(chars[index]);
                     index += 1;
                 }
-                let closed = index < chars.len();
-                if closed {
+                if index < chars.len() {
                     index += 1;
-                }
-                if !closed {
-                    continue;
-                }
-                if content.is_empty() {
-                    saw_quoted_null = true;
-                } else if matches!(content.as_str(), "$@" | "$*" | "${@}" | "${*}") {
-                    saw_quoted_at = true;
-                } else if content.contains("$@") || content.contains("${@}") {
-                    // A double-quoted string containing $@ among other
-                    // content (e.g. "$novar$@$(echo)") still triggers the
-                    // quoted-null retention rule when $@ is empty (exp9.sub
-                    // `''"$novar$@$(echo)"` with no positional params is one
-                    // empty argument).
-                    saw_quoted_at = true;
-                } else if quoted_pure_reference_expands_empty(&content, executor) {
-                    saw_quoted_null = true;
+                    if content.is_empty() || quoted_pure_reference_expands_empty(&content, executor)
+                    {
+                        saw_quoted_null = true;
+                    }
                 }
             }
             '$' if chars.get(index + 1) == Some(&'\'') => {
@@ -4979,7 +5797,7 @@ fn raw_quoted_at_word_has_quoted_null(raw: &str, executor: &Executor) -> bool {
             }
             '$' if chars.get(index + 1) == Some(&'{') => {
                 // The braced body keeps its quotes: scan it verbatim so a
-                // ${x+"$@"''} alternate still exposes its spans.
+                // ${x+"$@"''} alternate still exposes its quoted-null spans.
                 index += 2;
             }
             '`' => {
@@ -4992,24 +5810,269 @@ fn raw_quoted_at_word_has_quoted_null(raw: &str, executor: &Executor) -> bool {
                 }
                 index += 1;
             }
-            '$' if chars.get(index + 1) == Some(&'@') => {
-                // Unquoted $@ also triggers the quoted-null retention rule
-                // when adjacent to a quoted empty string (exp9.sub `''$@`
-                // with no positional params is one empty argument).
-                saw_quoted_at = true;
-                index += 2;
+            _ => index += 1,
+        }
+    }
+    saw_quoted_null
+}
+
+/// GNU subst.c:12026-12052 expand_word_internal tail for a word whose
+/// expansion came back EMPTY: one empty field survives iff
+///
+///     had_quoted_null || (quoted_dollar_at == 0 && PARTIALLY_QUOTED)
+///
+/// and the word is discarded for UNQUOTED, for quoted_dollar_at, and for
+/// WHOLLY_QUOTED without a quoted null (both else arms drop the word).
+///
+/// quoted_dollar_at (raw-level): a double-quoted span containing a
+/// positional/array @-list (`$@`, `${@}`, `${...[@]}`) — its pieces merge
+/// into the list, and an empty list swallows them WITHOUT flagging a
+/// quoted null: `"$xxx$@"` is 0 fields while `"$xxx""$@"` is 1.
+///
+/// had_quoted_null (raw-level): a word-level ''/""/$'' literal-empty
+/// span, or — reaching this check means the whole word expanded to
+/// nothing — a "..." span carrying an expansion but no @-list (it must
+/// have produced empty output itself: "$(true)" in `"$(true)""$@"`).
+/// Quoting inside a ${...} body or a substitution does not count: those
+/// are operands of that expansion, not the word's own quoting
+/// (`recho ${v= ''}` on empty output is ZERO fields — UNQUOTED).
+pub(in crate::executor) fn raw_empty_word_keeps_field(raw: &str, executor: &Executor) -> bool {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut index = 0usize;
+    let mut saw_quote = false;
+    let mut quoted_dollar_at = false;
+    let mut had_quoted_null = false;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            // Quotes inside a ${...} body or a command/arithmetic
+            // substitution are operands of that expansion — not the word's
+            // own quoting (quoted_state keys on word-level quote state):
+            // `${v= ''}` is UNQUOTED, and GNU discards its empty result.
+            '$' if chars.get(index + 1) == Some(&'{') => {
+                let rest: String = chars[index + 2..].iter().collect();
+                match matching_parameter_brace(&rest) {
+                    Some(end) => {
+                        index += 2 + rest[..end].chars().count() + 1;
+                    }
+                    None => index += 2,
+                }
             }
-            '$' if chars.get(index + 1) == Some(&'{')
-                && chars.get(index + 2) == Some(&'@')
-                && chars.get(index + 3) == Some(&'}') =>
-            {
-                saw_quoted_at = true;
-                index += 4;
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                index = crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                    .unwrap_or(chars.len());
+            }
+            '`' => {
+                index += 1;
+                while index < chars.len() && chars[index] != '`' {
+                    if chars[index] == '\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            '\'' => {
+                saw_quote = true;
+                let start = index;
+                index += 1;
+                while index < chars.len() && chars[index] != '\'' {
+                    index += 1;
+                }
+                if index == start + 1 {
+                    had_quoted_null = true;
+                }
+                index += 1;
+            }
+            '"' => {
+                saw_quote = true;
+                index += 1;
+                let start = index;
+                while index < chars.len() && chars[index] != '"' {
+                    if chars[index] == '\\' && index + 1 < chars.len() {
+                        index += 2;
+                        continue;
+                    }
+                    // A `${...}`/`$(...)` inside the span nests its own
+                    // quoting (parse.y:3877 parse_matched_pair /
+                    // parse_comsub): a `"` there does not close this span.
+                    if chars[index] == '$' && chars.get(index + 1) == Some(&'{') {
+                        let rest: String = chars[index + 2..].iter().collect();
+                        match matching_parameter_brace(&rest) {
+                            Some(end) => {
+                                index += 2 + rest[..end].chars().count() + 1;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    if chars[index] == '$' && chars.get(index + 1) == Some(&'(') {
+                        index = crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                            .unwrap_or(chars.len());
+                        continue;
+                    }
+                    index += 1;
+                }
+                let content: String = chars[start..index].iter().collect();
+                index += 1;
+                match quoted_span_at_list(&content, executor) {
+                    // An @-list with ZERO elements: chk_atstar set
+                    // quoted_dollar_at and the empty list swallowed the
+                    // span's other empty pieces — no quoted null
+                    // ("$xxx$@" is 0 fields).
+                    Some(true) => quoted_dollar_at = true,
+                    // An @-list with elements — all necessarily empty (the
+                    // word expanded to nothing): each is a quoted null
+                    // element, like "${arr[@]:+x}" on arr=('') — keep.
+                    Some(false) => had_quoted_null = true,
+                    // "" is a literal quoted null; a nonempty span at this
+                    // gate expanded empty — a quoted null too
+                    // (subst.c:11841-11847).
+                    None => had_quoted_null = true,
+                }
+            }
+            '$' if chars.get(index + 1) == Some(&'\'') => {
+                saw_quote = true;
+                index += 2;
+                let span_start = index;
+                while index < chars.len() && chars[index] != '\'' {
+                    index += 1;
+                }
+                if index == span_start {
+                    had_quoted_null = true;
+                }
+                index += 1;
             }
             _ => index += 1,
         }
     }
-    saw_quoted_at && saw_quoted_null
+    if had_quoted_null {
+        return true;
+    }
+    if quoted_dollar_at {
+        return false;
+    }
+    // PARTIALLY_QUOTED: the raw word has quoting but is not wholly quoted
+    // (raw_word_is_quoted). At this point the expansion produced nothing,
+    // so the quoted section produced an empty result and GNU keeps one
+    // empty field (subst.c:12031).
+    saw_quote && !raw_word_is_quoted(Some(raw))
+}
+
+/// Whether a double-quoted span's content carries an @-list at depth 0,
+/// and whether that list is EMPTY:
+///   Some(true)  — a `$@`, `${@...}`, or `${...[@]...}` whose expansion
+///                 took the @-LIST path and produced zero elements
+///                 (chk_atstar's quoted_dollar_at case, subst.c:7635-7639:
+///                 the empty list swallows the span's pieces — `"$xxx$@"`
+///                 and `"${@:+x}"` on an empty $@ are 0 fields).
+///   Some(false) — the span produced a quoted-null scalar or a list of
+///                 empty elements, keeping one empty field:
+///                 `"${arr[@]:+x}"` on arr=(''), `"${arr2[@]:+x}"` with
+///                 arr2 unset (the `+` set-check never expands a list),
+///                 `"${@:-}"` (the alternate produces a scalar).
+///   None        — no top-level @-list in the span.
+/// A `$@` nested inside a `${...}` operand (`"${foo=$@}"`) is NOT at word
+/// level — its list merges into the braced result, not the word's
+/// pieces — so it does not count.
+fn quoted_span_at_list(content: &str, executor: &Executor) -> Option<bool> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '$' if chars.get(index + 1) == Some(&'@') => {
+                return Some(executor.shell_state.positional_window().is_empty());
+            }
+            '$' if chars.get(index + 1) == Some(&'{') => {
+                let rest: String = chars[index + 2..].iter().collect();
+                let Some(end) = matching_parameter_brace(&rest) else {
+                    index += 2;
+                    continue;
+                };
+                let inner: String = rest[..end].chars().collect();
+                if inner.starts_with('@') {
+                    let positional = executor.shell_state.positional_window();
+                    return Some(match at_operator_kind(&inner[1..]) {
+                        // `${@:-x}`-family: the operator yields a scalar
+                        // word, not the positional list.
+                        AtOperator::Scalar => false,
+                        // List ops and the `+` set-check both expand the
+                        // @-list — empty positionals mean an empty list.
+                        _ => positional.is_empty(),
+                    });
+                }
+                let name_end = inner
+                    .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .unwrap_or(inner.len());
+                if inner[name_end..].starts_with("[@]") {
+                    let name = &inner[..name_end];
+                    let elements = executor.array_subscript_range_values(name, 0, None);
+                    return Some(match at_operator_kind(&inner[name_end + 3..]) {
+                        // `${arr[@]:-x}`-family: scalar result.
+                        AtOperator::Scalar => false,
+                        // `+` only expands the list when the array is SET:
+                        // unset -> scalar '' (quoted null, keep).
+                        AtOperator::SetCheck => elements.is_some_and(|v| v.is_empty()),
+                        // The list itself expands: unset OR zero-element
+                        // arrays are empty lists (quoted_dollar_at).
+                        AtOperator::List => elements.is_none_or(|v| v.is_empty()),
+                    });
+                }
+                index += 2 + inner.chars().count() + 1;
+            }
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                index = crate::lexer::skip_parenthesized_unit_corrected(&chars, index + 1)
+                    .unwrap_or(chars.len());
+            }
+            '`' => {
+                index += 1;
+                while index < chars.len() && chars[index] != '`' {
+                    if chars[index] == '\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The operator family following `@` or `[@]` inside `${...}`:
+///   List     — bare/slice/pattern/substitution/transform ops that expand
+///              the @-list itself (`${@}`, `${@:0:2}`, `${@#p}`, `${@Q}`).
+///   SetCheck — `+` (with or without `:`): GNU expands the parameter's
+///              list for the set test, so chk_atstar still runs
+///              (`"${@:+x}"` on an empty $@ is 0 fields).
+///   Scalar   — `-`/`=`/`?` (with or without `:`): the operator produces
+///              a scalar word — no @-list expansion, so an empty result
+///              is a quoted null (`"${@:-}"` on an empty $@ is `argv[1] = <>`).
+#[derive(Clone, Copy)]
+enum AtOperator {
+    List,
+    SetCheck,
+    Scalar,
+}
+
+fn at_operator_kind(rest: &str) -> AtOperator {
+    let first = rest.chars().next();
+    if first == Some(':') {
+        let op = rest[1..].chars().next();
+        return match op {
+            Some('+') => AtOperator::SetCheck,
+            Some('-' | '=' | '?') => AtOperator::Scalar,
+            // `${@:0}` / `${@: -1}` — subscript slice keeps the list.
+            _ => AtOperator::List,
+        };
+    }
+    match first {
+        Some('+') => AtOperator::SetCheck,
+        Some('-' | '=' | '?') => AtOperator::Scalar,
+        _ => AtOperator::List, // bare, slices handled above, transforms
+    }
 }
 
 /// "$e" / "${e}" with a currently empty (or unset) value is a quoted null
@@ -5640,6 +6703,17 @@ fn copy_comsub_body_verbatim_for_ifs_marking(
                 token_boundary = false;
             }
             '$' if next == Some('(') => {
+                // GNU parse.y:4173: a nested `$(` hands its whole span to
+                // parse_comsub — its `)` owns the inner substitution, never
+                // the enclosing case machinery. Skip the body opaquely via
+                // the same verbatim copy; the flat `depth += 1` here fed the
+                // span's interior to the case word machine, so `$(case
+                // $(ls) in *) ... ;; esac)` read `ls` as the subject word,
+                // then `ls`'s `)` never decremented the paren depth and the
+                // copy overran the substitution end. The `\u{1}` placeholder
+                // marks the skipped span as one word unit (the `\\` arm's
+                // convention), letting a `$(...)` case subject still
+                // complete `case WORD` for the `in` arm.
                 simulated.push('(');
                 *index += 1;
                 depth += 1;
@@ -6298,11 +7372,14 @@ fn strip_ifs_protection_markers(value: &str) -> std::borrow::Cow<'_, str> {
     // pipeline (glue removal, then guard strip).
     if !value.contains(crate::executor::markers::IFS_GLUE)
         && !value.contains(crate::executor::markers::ANSI_C_IFS_GUARD)
+        && !crate::executor::markers::contains_split_on_spaces_sentinel(value)
     {
         return std::borrow::Cow::Borrowed(value);
     }
     std::borrow::Cow::Owned(crate::executor::markers::strip_ansi_c_ifs_guard(
-        &value.replace(crate::executor::markers::IFS_GLUE, ""),
+        &crate::executor::markers::strip_split_on_spaces_sentinel(
+            &value.replace(crate::executor::markers::IFS_GLUE, ""),
+        ),
     ))
 }
 
@@ -6357,7 +7434,11 @@ fn skip_raw_command_substitution(chars: &[char], mut index: usize) -> usize {
         match chars[index] {
             '\'' => index = skip_raw_quote(chars, index + 1, '\''),
             '"' => index = skip_raw_quote(chars, index + 1, '"'),
-            '`' => index = skip_raw_backtick(chars, index + 1),
+            '`' => index = skip_raw_backtick(&chars, index + 1),
+            '$' if chars.get(index + 1) == Some(&'\'') => {
+                index = skip_raw_ansi_c_span(chars, index + 2);
+                continue;
+            }
             '$' if chars.get(index + 1) == Some(&'(') => {
                 depth += 1;
                 index += 2;
@@ -6383,18 +7464,18 @@ fn skip_raw_braced_parameter(chars: &[char], mut index: usize) -> usize {
         match chars[index] {
             '\'' => index = skip_raw_quote(chars, index + 1, '\''),
             '"' => index = skip_raw_quote(chars, index + 1, '"'),
-            '`' => index = skip_raw_backtick(chars, index + 1),
+            '`' => index = skip_raw_backtick(&chars, index + 1),
             '$' if chars.get(index + 1) == Some(&'{') => {
                 depth += 1;
                 index += 2;
                 continue;
             }
             '$' if chars.get(index + 1) == Some(&'(') => {
-                index = skip_raw_command_substitution(chars, index + 2);
+                index = skip_raw_command_substitution(&chars, index + 2);
                 continue;
             }
             '$' if chars.get(index + 1) == Some(&'\'') => {
-                index = skip_raw_quote(chars, index + 2, '\'');
+                index = skip_raw_ansi_c_span(chars, index + 2);
                 continue;
             }
             '$' if chars.get(index + 1) == Some(&'"') => {
@@ -6451,7 +7532,7 @@ fn skip_raw_backtick(chars: &[char], mut index: usize) -> usize {
 fn skip_raw_ansi_c_span(chars: &[char], mut index: usize) -> usize {
     while index < chars.len() {
         if chars[index] == '\\' {
-            index += 2;
+            index = (index + 2).min(chars.len());
             continue;
         }
         if chars[index] == '\'' {
@@ -6462,10 +7543,410 @@ fn skip_raw_ansi_c_span(chars: &[char], mut index: usize) -> usize {
     index
 }
 
+/// One emission in the `${param OP word}` alternate merge stream.
+enum AlternateEmit {
+    /// Literal source text or an expanded field: glues to the open field
+    /// or opens a new one.
+    Text(String),
+    /// A collapsed boundary (an ambient-IFS whitespace run, or an internal
+    /// field edge inside a piece): closes the open field without
+    /// producing an empty one.
+    WordBoundary,
+    /// A non-whitespace IFS delimiter: closes the current slot and
+    /// materializes it — GNU keeps the empty field a delimiter pair
+    /// bounds (`x::y` -> x, "", y) and even a leading one (`:x` -> "", x;
+    /// measured GNU 5.3.20).
+    DelimBoundary,
+}
+
+enum AlternatePiece {
+    /// Source text outside every quote: expands, then splits on every
+    /// ambient IFS char — expand_string_for_rhs runs the alternate under
+    /// W_NOSPLIT2, so add_ifs_character leaves literal IFS bytes raw
+    /// (subst.c:4462-4501, :11950-11980).
+    Unquoted(String),
+    /// A `'...'`, `"..."`, `$'...'` or `$"..."` span including its
+    /// delimiters: its expanded fields stay whole.
+    Quoted(String),
+}
+
+/// Split an alternate raw word at its top-level quote toggles. `$()`,
+/// `${}` and backtick bodies are opaque (a quote char inside an expansion
+/// does not toggle the word's quote state). `squotes_literal` is the
+/// `"${...}"`-outer case where `'` is an ordinary character (it never
+/// opens a quote inside double quotes), so only `"`-spans become Quoted
+/// pieces.
+fn segment_alternate_raw(raw: &str, squotes_literal: bool) -> Vec<AlternatePiece> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut index = 0usize;
+    macro_rules! flush {
+        () => {
+            if !current.is_empty() {
+                pieces.push(AlternatePiece::Unquoted(std::mem::take(&mut current)));
+            }
+        };
+    }
+    while index < chars.len() {
+        let ch = chars[index];
+        let dollar_quoted =
+            ch == '$' && index + 1 < chars.len() && matches!(chars[index + 1], '\'' | '"');
+        if ch == '"' || (ch == '\'' && !squotes_literal) || dollar_quoted {
+            flush!();
+            let start = index;
+            let quote = if dollar_quoted {
+                index += 1;
+                chars[index]
+            } else {
+                ch
+            };
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == '\\' && (quote != '\'' || dollar_quoted) {
+                    index += 2;
+                    continue;
+                }
+                if chars[index] == quote {
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            pieces.push(AlternatePiece::Quoted(
+                chars[start..index.min(chars.len())].iter().collect(),
+            ));
+        } else if ch == '\\' {
+            current.push(ch);
+            if index + 1 < chars.len() {
+                current.push(chars[index + 1]);
+            }
+            index += 2;
+        } else if ch == '`' || (ch == '$' && matches!(chars.get(index + 1), Some('(') | Some('{')))
+        {
+            let end = balanced_alternate_span_end(&chars, index);
+            for ch in &chars[index..end.min(chars.len())] {
+                current.push(*ch);
+            }
+            index = end;
+        } else {
+            current.push(ch);
+            index += 1;
+        }
+    }
+    flush!();
+    pieces
+}
+
+/// End offset of a `$(...)`, `${...}` or backtick span starting at index.
+fn balanced_alternate_span_end(chars: &[char], index: usize) -> usize {
+    match chars[index] {
+        '`' => skip_raw_backtick(&chars, index + 1),
+        '$' if chars.get(index + 1) == Some(&'(') => {
+            skip_raw_command_substitution(&chars, index + 2)
+        }
+        '$' if chars.get(index + 1) == Some(&'{') => skip_raw_braced_parameter(&chars, index + 2),
+        _ => index + 1,
+    }
+}
+
+/// End offset of an unquoted list-expansion token starting at index
+/// (`$@`, `$*`, `${@...}`, `${*...}`, `${name[@]}`, `${name[*]}`), or
+/// None when the char does not start one.
+fn unquoted_list_token_end(chars: &[char], index: usize) -> Option<usize> {
+    if chars[index] != '$' {
+        return None;
+    }
+    match chars.get(index + 1) {
+        Some('@') | Some('*') => Some(index + 2),
+        Some('{') => {
+            let end = skip_raw_braced_parameter(&chars, index + 2);
+            if end <= index + 2 {
+                return None;
+            }
+            let inner: String = chars[index + 2..end - 1].iter().collect();
+            if inner.starts_with('@') || inner.starts_with('*') {
+                return Some(end);
+            }
+            for marker in ["[@]", "[*]"] {
+                if let Some(pos) = inner.find(marker) {
+                    if crate::executor::support_names::is_shell_name(&inner[..pos]) {
+                        return Some(end);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Whether unquoted source text carries a list expansion (`$@`, `$*`,
+/// `${name[@]}` ...) at its top level.
+fn unquoted_alternate_text_has_list(text: &str, squotes_literal: bool) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '\'' => {
+                if squotes_literal {
+                    index += 1;
+                } else {
+                    index = skip_raw_quote(&chars, index + 1, '\'');
+                }
+            }
+            '"' => index = skip_raw_quote(&chars, index + 1, '"'),
+            '`' => index = skip_raw_backtick(&chars, index + 1),
+            '$' if matches!(chars.get(index + 1), Some('\'') | Some('"')) => {
+                index += 2;
+            }
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                index = skip_raw_command_substitution(&chars, index + 2);
+            }
+            '$' => {
+                if unquoted_list_token_end(&chars, index).is_some() {
+                    return true;
+                } else if chars.get(index + 1) == Some(&'{') {
+                    index = skip_raw_braced_parameter(&chars, index + 2);
+                } else {
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// Whether a fragment raw produces a list expansion GNU would flag
+/// *qdollaratp — an unquoted list token, or one inside a double-quoted
+/// piece (parameter_brace_expand_rhs, subst.c:8023-8027). Single-quoted
+/// pieces stay literal — except under `squotes_literal` (the rhs sits
+/// inside the enclosing `"${...}"`, where a `'` is an ordinary character
+/// and `$` inside still expands: `"${u- x:'$@' }"` -> `x 'p:q' 'r s'` on
+/// GNU 5.3.20), where their inner text scans like unquoted text.
+fn alternate_raw_has_list_expansion(raw: &str, squotes_literal: bool) -> bool {
+    segment_alternate_raw(raw, squotes_literal)
+        .iter()
+        .any(|piece| match piece {
+            AlternatePiece::Unquoted(text) => {
+                unquoted_alternate_text_has_list(text, squotes_literal)
+            }
+            AlternatePiece::Quoted(text) => {
+                text.starts_with('"')
+                    && text.len() >= 2
+                    && unquoted_alternate_text_has_list(&text[1..text.len() - 1], true)
+            }
+        })
+}
+
+/// Whether a token `unquoted_list_token_end` accepted is of the `$@`
+/// class (`$@`, `${@...}`, `${name[@]}`) — the only forms that set GNU's
+/// has_dollar_at and fire the deferred non-whitespace-IFS split under a
+/// quoted outer word (subst.c:12098-12160). `$*`/`${name[*]}` join into
+/// one field and do not split the literal affixes (measured GNU 5.3.20:
+/// `"${u- x:'$*' }"` -> one field `x:'p:q:r s'`).
+fn alternate_list_token_is_at(chars: &[char], index: usize, end: usize) -> bool {
+    match chars.get(index + 1) {
+        Some('@') => true,
+        Some('*') => false,
+        Some('{') => {
+            let inner: String = chars[index + 2..end - 1].iter().collect();
+            if inner.starts_with('@') {
+                return true;
+            }
+            if inner.starts_with('*') {
+                return false;
+            }
+            match inner.find("[@]") {
+                Some(pos) => crate::executor::support_names::is_shell_name(&inner[..pos]),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether unquoted source text carries a `$@`-class list expansion at
+/// its top level.
+fn unquoted_alternate_text_has_dollar_at(text: &str, squotes_literal: bool) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '\'' => {
+                if squotes_literal {
+                    index += 1;
+                } else {
+                    index = skip_raw_quote(&chars, index + 1, '\'');
+                }
+            }
+            '"' => index = skip_raw_quote(&chars, index + 1, '"'),
+            '`' => index = skip_raw_backtick(&chars, index + 1),
+            '$' if matches!(chars.get(index + 1), Some('\'') | Some('"')) => {
+                index += 2;
+            }
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                index = skip_raw_command_substitution(&chars, index + 2);
+            }
+            '$' => {
+                if let Some(end) = unquoted_list_token_end(&chars, index) {
+                    if alternate_list_token_is_at(&chars, index, end) {
+                        return true;
+                    }
+                    index = end;
+                } else if chars.get(index + 1) == Some(&'{') {
+                    index = skip_raw_braced_parameter(&chars, index + 2);
+                } else {
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// Whether a fragment raw contains a `$@`-class expansion — unquoted,
+/// inside `"..."`, or inside `'...'` when `squotes_literal` (see
+/// `alternate_raw_has_list_expansion`).
+pub(in crate::executor) fn alternate_raw_has_dollar_at(raw: &str, squotes_literal: bool) -> bool {
+    segment_alternate_raw(raw, squotes_literal)
+        .iter()
+        .any(|piece| match piece {
+            AlternatePiece::Unquoted(text) => {
+                unquoted_alternate_text_has_dollar_at(text, squotes_literal)
+            }
+            AlternatePiece::Quoted(text) => {
+                text.starts_with('"')
+                    && text.len() >= 2
+                    && unquoted_alternate_text_has_dollar_at(&text[1..text.len() - 1], true)
+            }
+        })
+}
+
+/// Parse a `${name OP rhs}` inner body for the `-`/`+` alternate family
+/// whose rhs carries a `$@`-class list source (GNU
+/// parameter_brace_expand_rhs, subst.c:7960-8070 -> expand_string_for_rhs
+/// subst.c:4462-4501): only that shape splices rhs fields into the
+/// enclosing word. Returns (name, rhs, use_when_set, require_non_empty).
+pub(in crate::executor) fn embedded_braced_alternate_parts(
+    inner: &str,
+) -> Option<(&str, &str, bool, bool)> {
+    for op in [":-", "-", ":+", "+"] {
+        if let Some((name, rhs)) =
+            super::expand_braced_ops::split_once_outside_subscript_str(inner, op)
+        {
+            if is_shell_name(name) && !rhs.is_empty() && alternate_raw_has_dollar_at(rhs, true) {
+                return Some((name, rhs, op.contains('+'), op.starts_with(':')));
+            }
+        }
+    }
+    None
+}
+
+/// Merge the emission stream into result fields (slot model: a
+/// non-whitespace IFS delimiter closes and pushes the pending slot even
+/// when empty, an IFS-whitespace boundary closes it only when it holds
+/// text, a trailing empty slot is dropped — measured GNU 5.3.20).
+fn merge_alternate_emits(emits: Vec<AlternateEmit>) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for emit in emits {
+        match emit {
+            AlternateEmit::Text(text) => {
+                current.get_or_insert_with(String::new).push_str(&text);
+            }
+            AlternateEmit::WordBoundary => {
+                if let Some(slot) = current.take() {
+                    result.push(slot);
+                }
+            }
+            AlternateEmit::DelimBoundary => {
+                result.push(current.take().unwrap_or_default());
+            }
+        }
+    }
+    if let Some(slot) = current {
+        result.push(slot);
+    }
+    result
+}
+
+/// Scan expansion-produced text of an unquoted alternate piece for
+/// ambient-IFS chars: whitespace IFS chars collapse to a boundary,
+/// non-whitespace ones delimit — the rhs expands under W_NOSPLIT2 so
+/// add_ifs_character leaves expansion-produced bytes raw in the istring
+/// for the caller's split (subst.c:4462-4501, :11950-11980,
+/// :12098-12160). In-band carriers keep themselves plus their payload
+/// byte opaque so an escaped or protected character cannot delimit.
+fn emit_alternate_scanned_text(text: &str, ifs_chars: &str, emits: &mut Vec<AlternateEmit>) {
+    let raw_byte_sentinel =
+        char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
+            .expect("raw-byte sentinel is a valid char");
+    let mut chunk = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ('\u{1}'..='\u{1f}').contains(&ch) || ch == raw_byte_sentinel {
+            // Carrier byte: keep the marker and its payload opaque.
+            chunk.push(ch);
+            if let Some(payload) = chars.next() {
+                chunk.push(payload);
+            }
+        } else if (raw_byte_sentinel..='\u{F8FF}').contains(&ch) {
+            // Registry-zone marker without a payload byte.
+            chunk.push(ch);
+        } else if ifs_chars.contains(ch) {
+            if !chunk.is_empty() {
+                emits.push(AlternateEmit::Text(std::mem::take(&mut chunk)));
+            }
+            emits.push(if ch.is_whitespace() {
+                AlternateEmit::WordBoundary
+            } else {
+                AlternateEmit::DelimBoundary
+            });
+        } else {
+            chunk.push(ch);
+        }
+    }
+    if !chunk.is_empty() {
+        emits.push(AlternateEmit::Text(chunk));
+    }
+}
+
+/// Emit the expansion fields an unquoted alternate piece produced.
+/// Under a set IFS the fields rejoin on the IFS first char like GNU's
+/// string_list_dollar_at PF_ASSIGNRHS join (subst.c:3020-3072) — the
+/// raw join bytes then split again with the same rules — and every
+/// unprotected IFS char in the joined text delimits. Under an empty IFS
+/// nothing splits, but the `$@`/`${a[@]}` element boundaries GNU marked
+/// with CTLNUL remain hard delimiters (subst.c:12153-12160).
+fn emit_unquoted_alternate_fields(
+    fields: Vec<String>,
+    ifs_chars: &str,
+    emits: &mut Vec<AlternateEmit>,
+) {
+    if ifs_chars.is_empty() {
+        for (index, field) in fields.into_iter().enumerate() {
+            if index > 0 {
+                emits.push(AlternateEmit::DelimBoundary);
+            }
+            emits.push(AlternateEmit::Text(field));
+        }
+        return;
+    }
+    let ifs_first = ifs_chars.chars().next().expect("non-empty IFS").to_string();
+    emit_alternate_scanned_text(&fields.join(&ifs_first), ifs_chars, emits);
+}
+
 #[cfg(test)]
 mod command_word_materialization_tests {
     use super::mark_literal_ifs_chars;
     use super::materialize_expanded_command_word;
+    use super::segment_alternate_raw;
+    use super::AlternatePiece;
     use super::{ifs_literal_marks_possible, mark_quoted_ifs_from_raw, raw_has_ifs_quote_bytes};
 
     #[test]
@@ -6972,6 +8453,21 @@ mod command_word_materialization_tests {
         // The word is `a\ : the escape hop inside the unclosed backtick span
         // lands one past the buffer; the copy loop must stop at the edge.
         let _ = mark_literal_ifs_chars(r#"`a\"#, " \t\n");
+    }
+
+    #[test]
+    fn alternate_raw_unclosed_command_substitution_does_not_panic() {
+        // The `${a+'$('\'}` alternate word (braces.tests:59): inside the
+        // enclosing `"${...}"` the `'` is literal, so `$(` opens a raw
+        // command-substitution scan whose quoted tail runs off the buffer —
+        // skip_raw_command_substitution returns len+1 and the piece copy
+        // must clamp to the buffer instead of slicing past it.
+        let pieces = segment_alternate_raw("'$('\\'", true);
+        assert_eq!(pieces.len(), 1);
+        match &pieces[0] {
+            AlternatePiece::Unquoted(text) => assert_eq!(text, "'$('\\'"),
+            AlternatePiece::Quoted(text) => panic!("unexpected quoted piece {text:?}"),
+        }
     }
 
     #[test]

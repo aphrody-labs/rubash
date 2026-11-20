@@ -298,13 +298,22 @@ impl Executor {
         // GNU read.def:482 input_is_pipe: a read whose descriptor is a
         // pipe is where a blocking builtin hands the SIGCHLD handler a
         // synchronous window — the dead coproc's reap (record) lands in
-        // that window and the cleanup after the command disposes it.
-        // The foreground-wait mark makes the next command-boundary
-        // refresh run the same retire-observed-coprocs step
-        // (flush_pending_coproc_retirements).
+        // that window and publishes at the next command-boundary
+        // refresh. Publication only: a builtin read is not a wait_for,
+        // so GNU disposal (cleanup_dead_jobs) does not follow it
+        // (rubash#2053) — the note must not move the disposal mark,
+        // or the boundary refresh would retire a sibling coproc whose
+        // child died during this read before the next command can
+        // expand its name (the named-coproc fd race:
+        // `read <&${A[0]}; read <&${B[0]}` losing B).
         if self.read_source_is_pipe(cmd, read_fd) {
-            self.note_foreground_wait();
+            self.note_blocking_read();
         }
+        // rubash#3944: mirror the `-d` word's first byte (read.def:385)
+        // onto the fd table for the record scanners, and retire it with
+        // this acquisition — a serve outside a `read` (`select`) must
+        // never key on a stale delimiter byte.
+        self.fd_table.read_delim_word_byte = self.read_delim_word_byte;
         // GNU builtins/read.def: NUL bytes in the input are skipped as
         // the record is read — they never reach the assigned value,
         // the IFS field splitting, or a -a array (rubash#1419:
@@ -322,7 +331,9 @@ impl Executor {
             exact_char_limit,
             escape_aware,
             raw,
-        )?;
+        );
+        self.fd_table.read_delim_word_byte = None;
+        let line = line?;
         // A record WAS served (possibly by a fallback transport after a
         // probed endpoint failed): any recorded hard read error belongs
         // to the abandoned probe, not to this read (rubash#1495).
@@ -771,6 +782,7 @@ impl Executor {
                 let (record, eof_no_delimiter) = slurped_record(
                     input,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -784,6 +796,7 @@ impl Executor {
                 let (record, eof_no_delimiter) = slurped_record(
                     input,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -871,6 +884,7 @@ impl Executor {
                 return Some(trim_read_input(
                     output,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -1000,6 +1014,7 @@ impl Executor {
                             Some(line) => trim_read_input(
                                 line,
                                 delimiter,
+                                self.read_delim_word_byte,
                                 char_limit,
                                 exact_char_limit,
                                 escape_aware,
@@ -1043,6 +1058,7 @@ impl Executor {
                             Some(line) => trim_read_input(
                                 line,
                                 delimiter,
+                                self.read_delim_word_byte,
                                 char_limit,
                                 exact_char_limit,
                                 escape_aware,
@@ -1064,6 +1080,7 @@ impl Executor {
                     let (record, eof_no_delimiter) = slurped_record(
                         output,
                         delimiter,
+                        self.read_delim_word_byte,
                         char_limit,
                         exact_char_limit,
                         escape_aware,
@@ -1155,6 +1172,7 @@ impl Executor {
                                     Some(line) => trim_read_input(
                                         line,
                                         delimiter,
+                                        self.read_delim_word_byte,
                                         char_limit,
                                         exact_char_limit,
                                         escape_aware,
@@ -1240,6 +1258,7 @@ impl Executor {
                 let (record, eof_no_delimiter) = slurped_record(
                     input,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -1515,6 +1534,7 @@ impl Executor {
                                 Some(line) => trim_read_input(
                                     line,
                                     delimiter,
+                                    self.read_delim_word_byte,
                                     char_limit,
                                     exact_char_limit,
                                     escape_aware,
@@ -1593,6 +1613,7 @@ impl Executor {
             let (record, eof_no_delimiter) = slurped_record(
                 input,
                 delimiter,
+                self.read_delim_word_byte,
                 char_limit,
                 exact_char_limit,
                 escape_aware,
@@ -1624,6 +1645,7 @@ impl Executor {
                 let (record, eof_no_delimiter) = slurped_record(
                     line,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -1803,6 +1825,7 @@ impl Executor {
             self.read_deadline,
             silent,
             delimiter,
+            self.read_delim_word_byte,
             char_limit,
             exact_char_limit,
             self.read_sigint_guard_armed,
@@ -1877,7 +1900,13 @@ impl Executor {
         // the delimiter's lead byte inside the record, cut -n units at an
         // invalid sequence's first byte, and let a continuation-byte
         // delimiter fire mid-character.
-        let mut scan = FdRecordScan::new(delimiter, char_limit, exact_char_limit, raw);
+        let mut scan = FdRecordScan::new(
+            delimiter,
+            self.fd_table.read_delim_word_byte,
+            char_limit,
+            exact_char_limit,
+            raw,
+        );
         let _ = escape_aware;
 
         // Bash keeps the coprocess descriptor open across read builtin calls.
@@ -1940,6 +1969,7 @@ impl Executor {
         Some(trim_read_input(
             bytes_to_shell_text(&bytes),
             delimiter,
+            self.read_delim_word_byte,
             char_limit,
             exact_char_limit,
             escape_aware,
@@ -2055,6 +2085,19 @@ impl Executor {
             crate::executor::read_helpers::TimesBaselineKind::ComsubBody,
             subshell.shell_state.subshell_depth.get(),
         );
+        // rubash#3932: the process-substitution body runs parse_and_execute
+        // in the forked child (subst.c:6362 process_substitute ->
+        // parse_and_execute "process substitution"), and
+        // should_suppress_fork passes the SUBSHELL_PROCSUB bit to
+        // should_optimize_fork (evalstring.c:106-117: `subshell ||`
+        // relaxes the redirects==0 arm) — so the body's single plain
+        // command exports live-1 even carrying redirects (GNU 5.3.20:
+        // `cat <(printenv SHLVL >/tmp/f)` still reads 5). The trap gate
+        // is re-checked at the spawn seam.
+        subshell.nofork_spawn_face_allows_redirects.set(true);
+        subshell.nofork_spawn_body_candidate_pending.set(
+            crate::executor::Executor::nofork_spawn_body_tail_ok(&ast.commands, true),
+        );
         let (thread_captured, result) =
             crate::executor::shell_options::capture_stdout(|| subshell.execute_ast(&ast));
         crate::executor::shell_options::end_capture_timing();
@@ -2122,6 +2165,7 @@ impl Executor {
                 return Some(trim_read_input(
                     line,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -2254,7 +2298,7 @@ impl Executor {
             .get(FUNCTION_STDIN)
             .map(|input| input[offset..].to_string())
         {
-            if joined_delimiter_scan_applies(&slice, delimiter)
+            if joined_delimiter_scan_applies(&slice, delimiter, self.read_delim_word_byte)
                 || byte_unit_scan_applies(&slice, char_limit)
             {
                 let input = self
@@ -2267,6 +2311,7 @@ impl Executor {
                 let scan = scan_text_record_bytes(
                     &slice,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -2298,6 +2343,7 @@ impl Executor {
                             let partial = scan_text_record_bytes(
                                 &input[offset..available_end],
                                 delimiter,
+                                self.read_delim_word_byte,
                                 char_limit,
                                 exact_char_limit,
                                 escape_aware,
@@ -2327,6 +2373,7 @@ impl Executor {
                     return Some(trim_read_input(
                         record,
                         delimiter,
+                        self.read_delim_word_byte,
                         char_limit,
                         exact_char_limit,
                         escape_aware,
@@ -2353,6 +2400,7 @@ impl Executor {
                 return Some(trim_read_input(
                     record,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     escape_aware,
@@ -2376,7 +2424,7 @@ impl Executor {
             // of the raw byte itself (rubash#2662) — match every form
             // and advance by the form that matched.
             let delimiter_needle = read_delimiter_needle(delimiter);
-            let delimiter_single = read_delimiter_single_form(delimiter);
+            let delimiter_single = read_delimiter_single_form(delimiter, self.read_delim_word_byte);
             // Count *decoded* units, not transport chars: a raw-byte marker
             // pair (E000 + E001..=E100) is ONE input byte and consumes ONE
             // unit of the -n/-N budget, and the pair is emitted whole so a
@@ -2508,6 +2556,7 @@ impl Executor {
         Some(trim_read_input(
             output,
             delimiter,
+            self.read_delim_word_byte,
             char_limit,
             exact_char_limit,
             escape_aware,
@@ -2671,7 +2720,7 @@ impl Executor {
             if !exact_char_limit
                 && !escaped
                 && !(escape_aware && matches!(unit, StdinUnit::Char('\\')))
-                && stdin_unit_is_delimiter(&unit, delimiter)
+                && stdin_unit_is_delimiter(&unit, delimiter, self.read_delim_word_byte)
             {
                 delimiter_found = true;
                 break;
@@ -2733,6 +2782,7 @@ impl Executor {
         Some(trim_read_input(
             output,
             delimiter,
+            self.read_delim_word_byte,
             char_limit,
             exact_char_limit,
             escape_aware,

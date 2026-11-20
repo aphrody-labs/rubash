@@ -90,10 +90,14 @@ pub(in crate::executor) fn rubash_spawn_inherited_state(key: &str) -> bool {
 /// (kernel resource state persists across GNU's execve; the env keys
 /// are the Windows-side model for real children too), the
 /// orig-ignores carrier (__RUBASH_TRAP_ORIG_IGN — trap.c
-/// original_signals SIG_IGN dispositions DO cross execve), and
-/// arbitrary session-mirrored probe keys (the G-03
-/// mirrored-assignment contract keeps a session's own mirrored
-/// `__RUBASH_*` writes visible to its children).
+/// original_signals SIG_IGN dispositions DO cross execve), the
+/// __RUBASH_FD_* delivery stamps (per-spawn fd-table transport minted
+/// fresh by the direct spawner for THIS child — init.rs consumes and
+/// strips them at entry, so they are delivery, not residue; stripping
+/// them for every non-respawn birth severed ALL fd>=3 delivery to
+/// children — rubash#3856), and arbitrary session-mirrored probe keys
+/// (the G-03 mirrored-assignment contract keeps a session's own
+/// mirrored `__RUBASH_*` writes visible to its children).
 pub(in crate::executor) fn fork_respawn_transport_key(key: &str) -> bool {
     const KEYS: &[&str] = &[
         // Variable-table serializations (the attribute strings
@@ -194,7 +198,6 @@ pub(in crate::executor) fn fork_respawn_transport_key(key: &str) -> bool {
     ];
     KEYS.contains(&key)
         || key.starts_with("__RUBASH_FORK_")
-        || key.starts_with("__RUBASH_FD_")
         || key.starts_with("__RUBASH_SETOPT_")
         || key.starts_with("__RUBASH_ALIAS_")
         || key.starts_with("__RUBASH_PARSE_")
@@ -285,6 +288,16 @@ pub(in crate::executor) const FORK_LINENO_TRANSPORT: &str = "__RUBASH_FORK_BASH_
 pub(in crate::executor) const FORK_ARGV_TRANSPORT: &str = "__RUBASH_FORK_BASH_ARGV";
 pub(in crate::executor) const FORK_ARGC_TRANSPORT: &str = "__RUBASH_FORK_BASH_ARGC";
 pub(in crate::executor) const FORK_ARGV_BOTTOM_TRANSPORT: &str = "__RUBASH_FORK_ARGV_BOTTOM";
+/// rubash#3909: the `bash_argv_initialized` flag (variables.c:5640-5650)
+/// rides the fork transport next to the bottom frame it qualifies.
+/// Presence with value "1" is the bit (the FORK_IN_FUNCTION
+/// convention): the spawner stamps it exactly when the flag is set, so
+/// a respawn child of a flag-set/bottom-None parent does not wrongly
+/// synthesize a ([0]="0") frame from its live window at its first
+/// top-level read. A child whose parent never armed extdebug gets no
+/// entry and is born with the flag clear, exactly as the parent was.
+pub(in crate::executor) const FORK_BASH_ARGV_INITIALIZED_TRANSPORT: &str =
+    "__RUBASH_FORK_BASH_ARGV_INITIALIZED";
 pub(in crate::executor) const FORK_IN_FUNCTION_TRANSPORT: &str = "__RUBASH_FORK_IN_FUNCTION";
 pub(in crate::executor) const FORK_MAIN_FRAME_TRANSPORT: &str = "__RUBASH_FORK_MAIN_FRAME";
 pub(in crate::executor) const FORK_PIPESTATUS_TRANSPORT: &str = "__RUBASH_FORK_PIPESTATUS";
@@ -299,6 +312,18 @@ pub(in crate::executor) const FORK_FN_SPANS_TRANSPORT: &str = "__RUBASH_FORK_FN_
 /// collect_command_line_spans order. See
 /// docs/design/respawn-root-line-spans.md.
 pub(in crate::executor) const FORK_ROOT_SPANS_TRANSPORT: &str = "__RUBASH_FORK_ROOT_SPANS";
+/// rubash#3347: the spawner's logical cwd (GNU
+/// the_current_working_directory, builtins/common.c:589), stamped by
+/// fork_context_transport_entries and consumed by the child's startup
+/// funnel under the provenance gate (init.rs). A GNU fork child
+/// inherits tcwd verbatim (execute_cmd.c:1576 execute_in_subshell,
+/// subst.c:6362 process_substitute); a respawned `rubash -c` child
+/// re-imports only its environment, so without this stamp its startup
+/// re-derives the logical cwd from the exported $PWD — and a forged
+/// $PWD moves it (variables.c:907 set_pwd adopts any same-directory
+/// spelling). Like the FORK_* keys, the child's init strips it
+/// unconditionally via FORK_TRANSPORT_KEYS.
+pub(in crate::executor) const LOGICAL_CWD_TRANSPORT: &str = "__RUBASH_LOGICAL_CWD";
 /// rubash#2456: the spawner's effective login state, stamped ONLY by
 /// the two process-substitution spawn sites. GNU's procsub fork
 /// (subst.c:6412-6445 process_substitute) is the one fork-shaped child
@@ -318,19 +343,21 @@ pub(in crate::executor) const FORK_ROOT_SPANS_TRANSPORT: &str = "__RUBASH_FORK_R
 pub(in crate::executor) const FORK_LOGIN_SHELL_TRANSPORT: &str = "__RUBASH_FORK_LOGIN_SHELL";
 
 /// Every FORK_* transport key, for the child's unconditional strip.
-pub(in crate::executor) const FORK_TRANSPORT_KEYS: [&str; 12] = [
+pub(in crate::executor) const FORK_TRANSPORT_KEYS: [&str; 14] = [
     FORK_FUNCNAME_TRANSPORT,
     FORK_SOURCE_TRANSPORT,
     FORK_LINENO_TRANSPORT,
     FORK_ARGV_TRANSPORT,
     FORK_ARGC_TRANSPORT,
     FORK_ARGV_BOTTOM_TRANSPORT,
+    FORK_BASH_ARGV_INITIALIZED_TRANSPORT,
     FORK_IN_FUNCTION_TRANSPORT,
     FORK_MAIN_FRAME_TRANSPORT,
     FORK_PIPESTATUS_TRANSPORT,
     FORK_FN_SPANS_TRANSPORT,
     FORK_ROOT_SPANS_TRANSPORT,
     FORK_LOGIN_SHELL_TRANSPORT,
+    LOGICAL_CWD_TRANSPORT,
 ];
 
 impl Executor {
@@ -395,6 +422,16 @@ impl Executor {
                 format_indexed_array_values(bottom),
             ));
         }
+        // rubash#3909: the flag rides with the frame it qualifies —
+        // stamped exactly when set (the FORK_IN_FUNCTION convention),
+        // so a respawn child of a flag-set/bottom-None parent keeps
+        // the initialized-but-empty state instead of synthesizing.
+        if self.shell_state.bash_argv_initialized.get() {
+            entries.push((
+                FORK_BASH_ARGV_INITIALIZED_TRANSPORT.to_string(),
+                "1".to_string(),
+            ));
+        }
         if self.shell_state.function_depth > 0 || inherited.is_some_and(|frames| frames.in_function)
         {
             entries.push((FORK_IN_FUNCTION_TRANSPORT.to_string(), "1".to_string()));
@@ -430,6 +467,20 @@ impl Executor {
                 FORK_FN_SPANS_TRANSPORT.to_string(),
                 format_indexed_array_values(span_entries),
             ));
+        }
+        // rubash#3347: the session's logical cwd rides the same stamp.
+        // The value is already the canonical form cd/startup
+        // established (or the verbatim uncanonicalized `cd .`
+        // make_absolute form GNU stores); the child's init adopts it
+        // verbatim once it still names the session cwd, and falls
+        // back to the $PWD adoption when it does not. An empty value
+        // is the unknown-birth state — there is no logical value to
+        // carry, and stamping it would let a stale empty ride past
+        // the child's validation.
+        if let Some(logical) = self.shell_state.logical_cwd.clone() {
+            if !logical.is_empty() {
+                entries.push((LOGICAL_CWD_TRANSPORT.to_string(), logical));
+            }
         }
         entries
     }
@@ -818,6 +869,7 @@ fn coproc_spec_binding(spec: &CoprocFdSpec, path: &Option<PathBuf>) -> Option<Co
                 file: Rc::new(FileFd {
                     handle: crate::fd::into_handle(cloned),
                     closed: std::cell::Cell::new(false),
+                    adopted: false,
                     path: path.clone().unwrap_or_default(),
                 }),
                 read: false,
@@ -831,6 +883,7 @@ fn coproc_spec_binding(spec: &CoprocFdSpec, path: &Option<PathBuf>) -> Option<Co
                 file: Rc::new(FileFd {
                     handle: crate::fd::into_handle(cloned),
                     closed: std::cell::Cell::new(false),
+                    adopted: false,
                     path: PathBuf::from("coproc:pipe"),
                 }),
                 read: false,
@@ -1079,14 +1132,21 @@ fn strip_consumed_redirects(command: &mut CommandNode, consumed: &[bool]) {
             }
         });
         if !remaining.iter().any(|redirect| {
-            redirect.fd.is_none() && matches!(redirect.kind, crate::parser::RedirectKind::HereDoc)
+            // rubash#3894: a `{var}<<` entry never owns the fd-0
+            // mirror, so it must not keep it alive during the prune.
+            redirect.fd_var.is_none()
+                && redirect.fd.is_none()
+                && matches!(redirect.kind, crate::parser::RedirectKind::HereDoc)
         }) {
             command.heredoc = None;
             command.heredoc_body = None;
             command.heredoc_delimiter = None;
         }
         if !remaining.iter().any(|redirect| {
-            redirect.fd.is_none()
+            // rubash#3894: see the HereDoc arm above — a `{var}<<<`
+            // entry never owns the fd-0 mirror either.
+            redirect.fd_var.is_none()
+                && redirect.fd.is_none()
                 && matches!(redirect.kind, crate::parser::RedirectKind::HereString)
         }) {
             command.here_string = None;
@@ -1342,6 +1402,44 @@ impl Executor {
         &mut self,
         background_command: &BackgroundCommand,
     ) -> Result<(), ExecuteError> {
+        // rubash#3932 async face: GNU's forked async child marks
+        // CMD_NO_FORK unconditionally (execute_cmd.c:4553 sets it in the
+        // make_child child half, no shape or trap consult), so the plain
+        // external this dispatch runs exports live-1 — redirects travel
+        // (resolved into the fork's stdio) and a parent-set EXIT/ERR
+        // trap does not block. Arm for the simple-command shapes only:
+        // compounds re-mark through their own faces (the in-process
+        // paren body walk, the wrapper respawn child) and pipeline
+        // members keep the forked face (SUBSHELL_PIPE, execute_cmd.c
+        // 5816). Saved and restored so the arm never leaks past this
+        // dispatch — the wrapper fallback respawns a child that arms
+        // through its own wrapper-role face.
+        let saved_stamp = self.nofork_spawn_dispatch_stamp.get();
+        let saved_unconditional = self.nofork_spawn_face_unconditional.get();
+        let saved_allows_redirects = self.nofork_spawn_face_allows_redirects.get();
+        if Self::nofork_spawn_async_simple_shape_ok(&background_command.command) {
+            let stamp = self.nofork_spawn_stamp_counter.get() + 1;
+            self.nofork_spawn_stamp_counter.set(stamp);
+            self.nofork_spawn_dispatch_stamp.set(stamp);
+            self.nofork_spawn_face_unconditional.set(true);
+            self.nofork_spawn_face_allows_redirects.set(true);
+        } else {
+            self.nofork_spawn_dispatch_stamp.set(0);
+            self.nofork_spawn_face_unconditional.set(false);
+        }
+        let result = self.execute_background_ast_command_inner(background_command);
+        self.nofork_spawn_dispatch_stamp.set(saved_stamp);
+        self.nofork_spawn_face_unconditional
+            .set(saved_unconditional);
+        self.nofork_spawn_face_allows_redirects
+            .set(saved_allows_redirects);
+        result
+    }
+
+    fn execute_background_ast_command_inner(
+        &mut self,
+        background_command: &BackgroundCommand,
+    ) -> Result<(), ExecuteError> {
         // GNU execute_simple_command runs run_debug_trap (execute_cmd.c:4506)
         // BEFORE make_child forks the async child (~4550), so `true &` reports
         // `DBG:true` from the parent. A compound async body ({ ...; } &,
@@ -1461,6 +1559,22 @@ impl Executor {
                 // (exported shell vars; no assignments exist at this gate).
                 let env_pairs =
                     self.compose_external_environment(&background_command.command, &program);
+                // rubash#3932: the direct async spawn is GNU's forked
+                // async child (execute_cmd.c:4553 CMD_NO_FORK, :5816
+                // adjust_shell_level(-1) before maybe_make_export_env) —
+                // export live-1 in its environment. The async arm above
+                // unconditional: no trap gate applies.
+                let env_pairs = if self.nofork_spawn_adjust_allowed() {
+                    let mut pairs = env_pairs;
+                    crate::executor::readonly_functions::env_pair_supercede(
+                        &mut pairs,
+                        "SHLVL".to_string(),
+                        self.nofork_spawn_adjusted_shlvl(),
+                    );
+                    pairs
+                } else {
+                    env_pairs
+                };
                 self.spawn_async_direct(
                     exec_path,
                     &argv,
@@ -1495,6 +1609,11 @@ impl Executor {
                     &mut process,
                     &program,
                 );
+                // rubash#3932: the direct async spawn exports live-1
+                // (execute_cmd.c:4553/5816) — same fold as the unix twin.
+                if self.nofork_spawn_adjust_allowed() {
+                    process.env("SHLVL", self.nofork_spawn_adjusted_shlvl());
+                }
                 self.stamp_spawn_cwd(&mut process);
                 suppress_orphan_console(&mut process);
                 process.spawn().map(crate::fd::SpawnedChild::from)
@@ -1532,6 +1651,16 @@ impl Executor {
                 Err(error) => return Err(error.into()),
             }
         }
+        // rubash#3300: mint the respawn proof FIRST, before any
+        // carrier dup is created (the stdio / fd>=3 dup loops below
+        // take the lowest free fds; the mint's F_DUPFD_CLOEXEC >= 100
+        // can never collide with them, and minting first guarantees
+        // the proof number is stable for the whole spawn). A mint
+        // failure is fail-open (None): the spawn proceeds without
+        // proof keys, i.e. today's behavior.
+        #[cfg(unix)]
+        let respawn_proof =
+            crate::fd::mint_respawn_proof(&crate::builtins::kill::new_background_wrapper_nonce());
         let exe = test_rubash_binary_from_env()
             .or_else(test_rubash_binary_from_current_exe)
             .or_else(|| std::env::current_exe().ok())
@@ -1554,6 +1683,30 @@ impl Executor {
                     !key.starts_with("__RUBASH_") || rubash_spawn_inherited_state(key)
                 })
                 .collect();
+        // rubash#3932: the wrapper child replays the GNU face its payload
+        // carries — a simple command rides the forked async child's
+        // unconditional mark (execute_cmd.c:4553), an absorbed `( list )`
+        // body replays the subshell mark (execute_cmd.c:1799-1806, trap
+        // and redirect gated), and any other compound body keeps the
+        // live level (optimize_subshell_command requires cm_simple,
+        // execute_cmd.c:1756). The key rides the validated nonce
+        // handshake; a forged ambient value arms nothing.
+        {
+            let payload_face =
+                if Self::nofork_spawn_async_simple_shape_ok(&background_command.command) {
+                    "simple"
+                } else if background_command.command.subshell_command.is_some()
+                    || background_command.command.subshell
+                {
+                    "subshell"
+                } else {
+                    "compound"
+                };
+            env_map.insert(
+                crate::builtins::kill::BACKGROUND_WRAPPER_PAYLOAD_FACE_KEY.to_string(),
+                payload_face.to_string(),
+            );
+        }
         // rubash#2486: iterate the SNAPSHOT, not the live table. The
         // VarTable is write-behind for the attribute keys (#916): the
         // serialized `__RUBASH_*_VARS` strings inside it are stale/absent
@@ -1682,6 +1835,21 @@ impl Executor {
             super::RESPAWN_SPAWNER_PID_KEY.to_string(),
             super::spawner_stamp_value(),
         );
+        // rubash#3300: the per-spawn proof pair (fd number + nonce).
+        // Per-spawn, never forwarded: these keys are NOT in
+        // FORK_TRANSPORT_KEYS / rubash_spawn_inherited_state, so a
+        // grandchild never inherits them — its own spawner mints a
+        // fresh proof for it. The #2356 spill below moves them onto
+        // the state-file transport only if they grow oversized; they
+        // never do (a decimal fd + 32 hex chars).
+        #[cfg(unix)]
+        if let Some((proof_fd, proof_nonce)) = &respawn_proof {
+            env_map.insert(
+                super::RESPAWN_PROOF_FD_KEY.to_string(),
+                proof_fd.to_string(),
+            );
+            env_map.insert(super::RESPAWN_PROOF_KEY.to_string(), proof_nonce.clone());
+        }
         // rubash#2521: this spawn is the whitelist transport
         // (fd::spawn_whitelisted below) — its fd stamps name
         // descriptors delivered AT their stamped numbers, and the
@@ -2056,6 +2224,18 @@ impl Executor {
                 env_map.insert(format!("__RUBASH_FD_WHANDLE_{fd}"), format!("{:#x}", dup));
                 env_map.insert(format!("__RUBASH_FD_WPATH_{fd}"), src_path);
             }
+        }
+
+        // rubash#3300: hand the proof fd to the whitelist transport
+        // (spawn_whitelisted dup2s each extra onto its own number in
+        // pre_exec — a no-op for an already-numbered fd — and the
+        // parent's copy closes with the other owned handles after the
+        // spawn lands). The mint already cleared CLOEXEC, so the fd
+        // survives exec at its number.
+        #[cfg(unix)]
+        if let Some((proof_fd, _)) = respawn_proof {
+            extra_handles.push(proof_fd);
+            owned_handles.push(proof_fd);
         }
 
         // rubash#2356: the composed environment itself is a state
@@ -2844,7 +3024,21 @@ impl Executor {
     /// never in the parent walk of resolve_background_stdio.
     fn background_redirect_target_is_fifo(&self, target: &str) -> bool {
         let path = self.session_path(shell_path_to_windows(target, &self.shell_state.env_vars));
-        super::shell_options::redirect_path_is_fifo(&path)
+        if super::shell_options::redirect_path_is_fifo(&path) {
+            return true;
+        }
+        // rubash#3286: the joined-path check above misses from a
+        // deleted cwd — the anchor's fstatat classifies there, and a
+        // FIFO still defers its open to the child exactly as above
+        // (rubash#1862: the parent must not take the rendezvous).
+        #[cfg(unix)]
+        {
+            let fs_operand = self.redirect_target_filesystem_path(target);
+            if fs_operand.is_relative() && self.anchor_operand_is_fifo(&fs_operand) == Some(true) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Defer fds to the background child (rubash#1862): mark them
@@ -4410,7 +4604,7 @@ impl Executor {
         // so `( exec 3<&- )` cannot close the parent's fd 3. Rc-shared
         // entries still alias the same open file description — reads in the
         // subshell advance the shared offset, matching fork().
-        let saved_fd_table = self.fd_table.clone();
+        let saved_fd_table = self.fd_table.saved_table();
         let saved_depth = self.shell_state.subshell_depth.get();
         // GNU execute_cmd.c runs `( list )` via execute_in_subshell ->
         // make_child: the forked child owns its own cwd, so a `cd` in the
@@ -4641,6 +4835,25 @@ impl Executor {
                     // spans the EXIT trap too — GNU runs it inside the
                     // forked child.
                     let _profiler_subshell = super::profiler::enter_subshell();
+                    // rubash#3932: GNU marks the subshell body's
+                    // qualifying command before dispatching it
+                    // (execute_cmd.c:1756 optimize_subshell_command ->
+                    // :1803 CMD_NO_FORK), so the body's tail plain spawn
+                    // exports live-1 while earlier body nodes keep the
+                    // forked face. The walk consumes the candidate
+                    // one-shot and arms the spawn stamp at the tail's
+                    // dispatch; the seam re-checks the trap state at
+                    // spawn time (the forked child reset the parent's
+                    // traps, trap.c:1480, and traps armed inside the
+                    // body block the mark). Redirects block the mark:
+                    // optimize_subshell_command consults
+                    // should_optimize_fork with subshell==0, whose
+                    // redirects==0 arm holds (evalstring.c:106-117).
+                    executor.nofork_spawn_face_allows_redirects.set(false);
+                    let timed_free = executor.timed_dispatch_depth.get() == 0;
+                    executor
+                        .nofork_spawn_body_candidate_pending
+                        .set(timed_free && Self::nofork_spawn_body_tail_ok(body, false));
                     let body_result = executor.execute_ast_inner(body);
                     // GNU execute_cmd.c execute_in_subshell: expr.c
                     // evalerror's jump_to_top_level(DISCARD) reaches only the
@@ -5655,6 +5868,17 @@ impl Executor {
         // order is preserved exactly; the spill + apply happen just
         // before the spawn, so no temp file exists on the
         // redirect-error / pipe-failure paths in between.
+        // rubash#3300: mint the respawn proof before the carrier
+        // dups are created (apply_coproc_redirects below) — respawn
+        // route only; a direct (foreign) child carries no proof. A
+        // mint failure is fail-open (None): the spawn proceeds
+        // without proof keys, i.e. today's behavior.
+        #[cfg(unix)]
+        let respawn_proof = if direct_plan.is_none() {
+            crate::fd::mint_respawn_proof(&crate::builtins::kill::new_background_wrapper_nonce())
+        } else {
+            None
+        };
         let mut env_entries: Vec<(String, String)> = Vec::new();
         if direct_plan.is_none() {
             // rubash#2486: the snapshot materializes the attribute
@@ -5795,6 +6019,17 @@ impl Executor {
                 super::RESPAWN_SPAWNER_PID_KEY.to_string(),
                 super::spawner_stamp_value(),
             ));
+            // rubash#3300: the per-spawn proof pair (fd number +
+            // nonce). Per-spawn, never forwarded — NOT in
+            // FORK_TRANSPORT_KEYS / rubash_spawn_inherited_state.
+            #[cfg(unix)]
+            if let Some((proof_fd, proof_nonce)) = &respawn_proof {
+                env_entries.push((
+                    super::RESPAWN_PROOF_FD_KEY.to_string(),
+                    proof_fd.to_string(),
+                ));
+                env_entries.push((super::RESPAWN_PROOF_KEY.to_string(), proof_nonce.clone()));
+            }
             // rubash#1074: the coproc body runs in a forked subshell
             // (execute_in_subshell: subshell_level++), so the child's
             // BASH_SUBSHELL starts at this shell's depth + 1.
@@ -5973,6 +6208,27 @@ impl Executor {
                 use std::os::unix::process::CommandExt as _;
                 child.pre_exec(crate::builtins::kill::child_pre_exec_unblock_sigpipe);
             }
+            // rubash#3300: the mint already cleared CLOEXEC on the
+            // proof fd; re-clear it here so the fd survives exec at
+            // its number even if a carrier pass re-armed it (the
+            // pin-pass pre_exec above never touches it, but the
+            // guarantee is cheap). The parent's copy closes with the
+            // other numbered-fd dups after the spawn attempt (the
+            // loop at the end of this fn, rubash#2200).
+            #[cfg(unix)]
+            if let Some((proof_fd, _)) = respawn_proof {
+                unsafe {
+                    use std::os::unix::process::CommandExt as _;
+                    child.pre_exec(move || {
+                        let flags = libc::fcntl(proof_fd, libc::F_GETFD);
+                        if flags >= 0 {
+                            libc::fcntl(proof_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                        }
+                        Ok(())
+                    });
+                }
+                coproc_fd_dups.push(proof_fd);
+            }
             suppress_orphan_console(&mut child);
             self.stamp_spawn_cwd(&mut child);
             // rubash#2356: spill + apply the gathered respawn
@@ -5988,6 +6244,12 @@ impl Executor {
                     child.env(key, value);
                 }
             }
+            // rubash#3219: a coproc child born inside an in-process
+            // fork region takes the region's recorded ulimit pairs at
+            // birth (see spawn_external_process's arm) — GNU's coproc
+            // child is a fork of the region's shell and carries its
+            // pair. No-op when no emulated-limit cells exist.
+            crate::builtins::ulimit::arm_emulated_limits(&mut child, &self.shell_state.env_vars);
             match child.spawn() {
                 Ok(mut child_proc) => {
                     // Rubash does not expose real coproc file descriptors yet,
@@ -6051,11 +6313,13 @@ impl Executor {
                     let coproc_write_file = Rc::new(FileFd {
                         handle: crate::fd::into_handle(stdin_writer),
                         closed: std::cell::Cell::new(false),
+                        adopted: false,
                         path: std::path::PathBuf::from(format!("coproc:{pid}:stdin")),
                     });
                     let coproc_read_file = Rc::new(FileFd {
                         handle: crate::fd::into_handle(stdout_reader),
                         closed: std::cell::Cell::new(false),
+                        adopted: false,
                         path: std::path::PathBuf::from(format!("coproc:{pid}:stdout")),
                     });
                     let (coproc_read_fd, coproc_write_fd) = self.allocate_coproc_fds();
@@ -6514,6 +6778,7 @@ impl Executor {
                                     file: Rc::new(FileFd {
                                         handle: crate::fd::into_handle(file),
                                         closed: std::cell::Cell::new(false),
+                                        adopted: false,
                                         path: self.session_path(shell_path_to_windows(
                                             &target,
                                             &self.shell_state.env_vars,
@@ -6552,6 +6817,7 @@ impl Executor {
                                     file: Rc::new(FileFd {
                                         handle: crate::fd::into_handle(file),
                                         closed: std::cell::Cell::new(false),
+                                        adopted: false,
                                         path: session_target,
                                     }),
                                     read: false,
@@ -6877,6 +7143,7 @@ impl Executor {
                                     file: Rc::new(FileFd {
                                         handle: crate::fd::into_handle(file),
                                         closed: std::cell::Cell::new(false),
+                                        adopted: false,
                                         path: self.session_path(shell_path_to_windows(
                                             &target,
                                             &self.shell_state.env_vars,
@@ -6908,6 +7175,7 @@ impl Executor {
                                 file: Rc::new(FileFd {
                                     handle: crate::fd::into_handle(file),
                                     closed: std::cell::Cell::new(false),
+                                    adopted: false,
                                     path: session_target,
                                 }),
                                 read: true,

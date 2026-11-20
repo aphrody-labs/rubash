@@ -6,7 +6,7 @@ use crate::executor::pipeline_exec::command_is_compound_pipeline_stage;
 /// niubash#345: adopt a duplicated host handle as a child's `Stdio`. The
 /// caller hand-duplicates the pipeline write end so the child owns a private
 /// copy (the parent keeps its own until the producer stage returns).
-fn stdio_from_fd_handle(handle: crate::fd::HANDLE) -> Stdio {
+pub(in crate::executor) fn stdio_from_fd_handle(handle: crate::fd::HANDLE) -> Stdio {
     #[cfg(windows)]
     {
         use std::os::windows::io::FromRawHandle;
@@ -655,6 +655,28 @@ impl Executor {
 
         // G-02: no process-cwd save/restore (stage subshell clone, as above).
         let mut subshell = self.command_substitution_executor();
+        // rubash#3875: the stage gate's parked opens (the pending
+        // channel) belong to this stage's redirect list - move the
+        // entries that name this stage's own entries into the stage
+        // subshell, keyed by the same list positions, and exempt the
+        // subshell's first reject gate from clearing them, so the
+        // body's binds adopt the gate's one open per entry instead
+        // of re-opening by path (the builtin stage's transfer is the
+        // strip-aware twin of this move).
+        let mut transferred_any = false;
+        for (position, redirect) in command.redirects.iter().enumerate() {
+            if redirect.fd_var.is_some() {
+                continue;
+            }
+            let target = self.expand_redirect_target(redirect);
+            if let Some(file_fd) = self.take_pending_preopened(position, &target) {
+                subshell.store_pending_preopened(position, &target, file_fd);
+                transferred_any = true;
+            }
+        }
+        if transferred_any {
+            subshell.preopened_pending_preserved_once.set(true);
+        }
         // rubash#2487: a pipeline element is an execute_in_subshell
         // child — its job_control variable starts erased
         // (jobs.c:5356-5366 without_job_control) even when the
@@ -991,14 +1013,20 @@ impl Executor {
         // rubash#846: the preflight can return Err (unopenable `>file`).
         // Restore the active thread-local capture before propagating or
         // every later stdout write is swallowed into the orphaned buffer.
-        let builtin_stage_output_redirect_failed =
-            match self.pipeline_stage_output_redirect_fails(&call) {
-                Ok(failed) => failed,
+        let (builtin_stage_output_redirect_failed, builtin_stage_preopened) =
+            match self.pipeline_stage_output_redirect_fails_with_preopened(&call) {
+                Ok(pair) => pair,
                 Err(error) => {
                     crate::executor::shell_options::restore_stdout_capture(saved_capture);
                     return Err(error);
                 }
             };
+        // rubash#3875: park the clone gate's opens back into the
+        // pending channel (its walk adopted most of them from there)
+        // so the driver's routing walk — which applies the original
+        // command's list, the same positions this gate walked —
+        // adopts the entries' one open instead of re-opening by path.
+        self.park_preopened_redirects(&call, &builtin_stage_preopened);
         if builtin_stage_output_redirect_failed {
             // rubash#1844: same pre-wired contract as the stage
             // preflight in pipeline_exec.rs — the element died at
@@ -1056,11 +1084,14 @@ impl Executor {
         // a DuplicateInput assigning fd 1 (`1<&2`) is an fd-1 assignment
         // the walk resolves, while one assigning fd 0 (`<&2`) is the
         // element's stdin and stays.
-        call.redirects.retain(|redirect| {
+        // rubash#3875: the strip predicate, shared with the
+        // preopened transfer below (which re-keys parked handles by
+        // the positions entries hold AFTER this strip).
+        let stage_redirect_stripped = |redirect: &crate::parser::Redirect| -> bool {
             if redirect.fd_var.is_some() {
-                return true;
+                return false;
             }
-            let strips = match redirect.kind {
+            match redirect.kind {
                 crate::parser::RedirectKind::CombinedOutput
                 | crate::parser::RedirectKind::CombinedAppend => true,
                 crate::parser::RedirectKind::Output
@@ -1073,11 +1104,36 @@ impl Executor {
                     matches!(redirect.fd, Some(1) | Some(2))
                 }
                 _ => false,
-            };
-            !strips
-        });
+            }
+        };
+        call.redirects
+            .retain(|redirect| !stage_redirect_stripped(redirect));
 
         let mut subshell = self.command_substitution_executor();
+        // rubash#3875: hand the subshell the parked handles for the
+        // entries that survive the strip, re-keyed to their stripped
+        // positions: the parent's reject probe and stage gates
+        // already performed those entries' one open (GNU opens each
+        // entry once, redir.c do_redirections), so the subshell's
+        // funnels adopt instead of re-opening — a re-open fails
+        // EACCES on a target created without owner-write (umask
+        // masking 0200). The one-shot flag keeps the subshell's
+        // first reject gate from clearing the transferred entries
+        // before its probe and bind walks can adopt them.
+        {
+            let mut stripped_position = 0usize;
+            for (position, redirect) in command.redirects.iter().enumerate() {
+                if stage_redirect_stripped(redirect) {
+                    continue;
+                }
+                let target = self.expand_redirect_target(redirect);
+                if let Some(file_fd) = self.take_pending_preopened(position, &target) {
+                    subshell.store_pending_preopened(stripped_position, &target, file_fd);
+                }
+                stripped_position += 1;
+            }
+            subshell.preopened_pending_preserved_once.set(true);
+        }
         // rubash#2487: a pipeline element is an execute_in_subshell
         // child — its job_control variable starts erased
         // (jobs.c:5356-5366 without_job_control) even when the
@@ -1283,6 +1339,9 @@ impl Executor {
         command: &CommandNode,
         input: &str,
         stdin_inherit: bool,
+        mut preopened: Option<
+            &mut std::collections::HashMap<usize, std::rc::Rc<crate::executor::fd_table::FileFd>>,
+        >,
     ) -> Result<Option<(String, String, i32)>, ExecuteError> {
         let (command, process_substitution_files) =
             self.command_with_process_substitution_files(command)?;
@@ -1310,7 +1369,12 @@ impl Executor {
         let result = if fd_var_failed {
             Ok(Some((String::new(), String::new(), 1)))
         } else {
-            self.execute_external_pipeline_stage_inner(&command, input, stdin_inherit)
+            self.execute_external_pipeline_stage_inner(
+                &command,
+                input,
+                stdin_inherit,
+                preopened.as_deref_mut(),
+            )
         };
         // rubash#2590: the stage's child has exited by now (the inner
         // funnel reaps it before returning), so settle any own-binding
@@ -1485,6 +1549,9 @@ impl Executor {
         command: &CommandNode,
         input: &str,
         stdin_inherit: bool,
+        mut preopened: Option<
+            &mut std::collections::HashMap<usize, std::rc::Rc<crate::executor::fd_table::FileFd>>,
+        >,
     ) -> Result<Option<(String, String, i32)>, ExecuteError> {
         // rubash#2502: a fresh command recomputes its own numbered
         // input bindings (the rubash#2235 discipline the plain path
@@ -1754,6 +1821,12 @@ impl Executor {
         // expanded this prefix once, so a delta would miss it).
         let prefix_arith_before = self.snapshot_arithmetic_error_flags();
         let raws_aligned = command.assignment_raws.len() == command.assignments.len();
+        // The stage's assignments were never applied to the table, so
+        // each composed bind is staged into the lookup path as the
+        // loop walks left to right — GNU's assign_in_env /
+        // temporary_env order (see stage_composition_bind) — and
+        // restored when the composition finishes.
+        let mut composition_undo = Vec::new();
         for (index, (var_name, var_value)) in command.assignments.iter().enumerate() {
             let (base_name, append) = assignment_name_and_append(var_name);
             let raw = raws_aligned
@@ -1777,15 +1850,18 @@ impl Executor {
                 // plus the literal RHS text (rubash#1620 — re-applying the
                 // raw RHS lost the base and leaked the marker).
                 let window = format!("{}{}", self.tempenv_scalar_view(base_name), expanded_value);
+                self.stage_composition_bind(&mut composition_undo, base_name, &window);
                 if is_valid_process_env(base_name, &window) {
                     process.env(base_name, window);
                 }
                 continue;
             }
+            self.stage_composition_bind(&mut composition_undo, base_name, expanded_value);
             if is_valid_process_env(base_name, expanded_value) {
                 process.env(base_name, expanded_value);
             }
         }
+        self.restore_composition_binds(composition_undo);
         // rubash#3456: a fatal arithmetic error in the prefix was already
         // diagnosed once by the composition above (and the stage status
         // folds to 1); GNU discards the whole element, so the child must
@@ -2149,8 +2225,17 @@ impl Executor {
         // element's own redirections in its fork before exec
         // (redir.c:237 do_redirections), so a stage child must find
         // its `3<seed` binding at fd 3.
-        let stage_fd_delivery_dups =
-            self.apply_external_fd_delivery(command, &mut process, Some(&stage_stdio));
+        // rubash#3875: the stage gate's preopened map is threaded
+        // here from execute_pipeline_stage_inner (the gate runs
+        // there, the spawn here) — the stage's fd>=3 delivery binds
+        // the gate's descriptions instead of re-opening by path
+        // (the probe-then-bind residual of rubash#3828).
+        let stage_fd_delivery_dups = self.apply_external_fd_delivery(
+            command,
+            &mut process,
+            Some(&stage_stdio),
+            preopened.as_deref_mut(),
+        );
         // rubash#438: pin the buffered process-substitution pipe read ends at
         // their /dev/fd/N numbers in the child (fork-exec dup2), so the
         // literal argv word resolves through the OS /dev/fd layer.

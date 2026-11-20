@@ -11,6 +11,15 @@ pub(in crate::executor) struct SavedNumberedFd {
     fd_stdin: Option<String>,
     fd_stdin_offset: Option<String>,
     fd_dynamic: Option<String>,
+    /// rubash#3806: the input bind retires the slot's write arm
+    /// (open_input is a wholesale dup2), so the scoped bind clears the
+    /// output ledger — but a compound scope RESTORES the pre-command
+    /// entry afterwards, write arm and deferred `>(...)` registration
+    /// included. Save both output keys with the rest of the slot's
+    /// state or the restored endpoint is left pointing at a body that
+    /// can never run (same union SavedDynamicClose keeps).
+    fd_output: Option<String>,
+    fd_procsub: Option<String>,
     fd_closed: Option<String>,
 }
 
@@ -559,7 +568,21 @@ impl Executor {
                 inserted_saves.push((*slot, entry.clone()));
             }
         }
+        // rubash#3917: the body runs inside this command's redirect
+        // bracket — mark it so a persistent `exec` in the body does
+        // not place files onto kernel descriptors the bracket's
+        // table-only restore cannot undo (see the field doc). A
+        // compound carrying no redirections applies and restores
+        // nothing, so its body is not a bracket: a bare group is no
+        // fork in GNU either, and an `exec` inside one persists.
+        let bracket_active = !cmd.redirects.is_empty() || !cmd.heredoc_redirects.is_empty();
+        if bracket_active {
+            self.compound_redirect_scope_depth += 1;
+        }
         let result = self.with_command_input_redirects_inner(cmd, execute);
+        if bracket_active {
+            self.compound_redirect_scope_depth -= 1;
+        }
         // The saves die with the command's redirections: remove
         // exactly the entries still holding the inserted clone (a
         // body that rebound the slot owns its binding now).
@@ -692,6 +715,11 @@ impl Executor {
         for saved in saved {
             match saved.entry {
                 Some(entry) => {
+                    // rubash#3938 face C: land the saved entry back
+                    // onto its kernel number (GNU's undo replays a
+                    // r_move record: dup2 the save back, close it —
+                    // redir.c:1399 add_undo_fd_redirect).
+                    let entry = self.fd_table.land_restored_entry(saved.fd, entry);
                     self.fd_table.entries.insert(saved.fd, entry);
                 }
                 None => {
@@ -1328,6 +1356,12 @@ impl Executor {
                 .env_vars
                 .get(&fd_dynamic_input_key(fd))
                 .cloned(),
+            fd_output: self.shell_state.env_vars.get(&fd_output_key(fd)).cloned(),
+            fd_procsub: self
+                .shell_state
+                .env_vars
+                .get(&fd_output_process_substitution_key(fd))
+                .cloned(),
             fd_closed: self.shell_state.env_vars.get(&fd_closed_key(fd)).cloned(),
         });
         Ok(())
@@ -1357,13 +1391,21 @@ impl Executor {
         cmd: &CommandNode,
     ) -> Result<Vec<SavedNumberedFd>, ExecuteError> {
         let mut saved: Vec<SavedNumberedFd> = Vec::new();
-        self.open_compound_numbered_input_redirects_in(
+        if let Err(error) = self.open_compound_numbered_input_redirects_in(
             cmd,
             0,
             cmd.redirects.len(),
             &mut saved,
             MoveSourceSave::GnuUndoable,
-        )?;
+        ) {
+            // GNU undo_partial_redirects (execute_cmd.c:855 via
+            // redir.c's undo list, add_undo_redirect:1326): a
+            // mid-list failure unwinds every bind the walk already
+            // applied. Restore the pre-list entries before the
+            // error propagates (rubash#3733).
+            self.restore_compound_numbered_input_redirects(saved);
+            return Err(error);
+        }
         Ok(saved)
     }
 
@@ -1472,14 +1514,16 @@ impl Executor {
                             gate_fires = FileFd::open_read(path).is_ok();
                         }
                         crate::parser::RedirectKind::ReadWrite => {
-                            if !target.starts_with("/dev/")
+                            if is_null_device(&target) {
+                                gate_fires = self.probe_input_redirect_readwrite(&target).is_ok();
+                            } else if !target.starts_with("/dev/")
                                 && !crate::special_paths::is_net_redirect_target(&target)
                             {
                                 let path = self.session_path(shell_path_to_windows(
                                     &target,
                                     &self.shell_state.env_vars,
                                 ));
-                                let _ = FileFd::open_readwrite_pair(path);
+                                gate_fires = FileFd::open_readwrite_pair(path).is_ok();
                             }
                         }
                         _ => {}
@@ -1540,6 +1584,15 @@ impl Executor {
             if is_closed_redirect_target(&target) {
                 continue;
             }
+            // rubash#3815: GNU redir.c redir_open has no /dev/null
+            // shortcut — the null device is an ordinary file open, so
+            // on Unix the bind must fall through to the plain open
+            // below and install a real descriptor. An empty-text
+            // endpoint delivers a synthetic carrier pipe to children
+            // (`ls -l /proc/self/fd/8` shows pipe:[...] where GNU shows
+            // /dev/null). Windows keeps the synthetic empty bind: it
+            // has no /dev/null path to open.
+            #[cfg(not(unix))]
             if is_null_device(&target) {
                 self.set_fd_input_bytes(fd, Vec::new(), true);
                 if redirect.kind == crate::parser::RedirectKind::ReadWrite {
@@ -1729,6 +1782,11 @@ impl Executor {
         for saved in saved {
             match saved.entry {
                 Some(entry) => {
+                    // rubash#3938 face C: land the saved entry back
+                    // onto its kernel number (GNU's undo replays a
+                    // r_move record: dup2 the save back, close it —
+                    // redir.c:1399 add_undo_fd_redirect).
+                    let entry = self.fd_table.land_restored_entry(saved.fd, entry);
                     self.fd_table.entries.insert(saved.fd, entry);
                 }
                 None => {
@@ -1749,6 +1807,16 @@ impl Executor {
                 &mut self.shell_state.env_vars,
                 &fd_dynamic_input_key(saved.fd),
                 saved.fd_dynamic,
+            );
+            restore_optional_env_var(
+                &mut self.shell_state.env_vars,
+                &fd_output_key(saved.fd),
+                saved.fd_output,
+            );
+            restore_optional_env_var(
+                &mut self.shell_state.env_vars,
+                &fd_output_process_substitution_key(saved.fd),
+                saved.fd_procsub,
             );
             restore_optional_env_var(
                 &mut self.shell_state.env_vars,
@@ -1879,7 +1947,7 @@ impl Executor {
         saved: &mut Vec<SavedOutputFd>,
         move_source_save: MoveSourceSave,
     ) -> Result<(), ExecuteError> {
-        for redirect in &cmd.redirects[start..end] {
+        for (offset, redirect) in cmd.redirects[start..end].iter().enumerate() {
             // `{var}`-targeted redirections allocate a persistent dynamic fd
             // (redir.c: the variable keeps the descriptor after the command)
             // and are handled by execute_dynamic_fd_var_redirect above.
@@ -1928,23 +1996,19 @@ impl Executor {
                     match redirect.kind {
                         crate::parser::RedirectKind::Append
                         | crate::parser::RedirectKind::CombinedAppend => {
-                            if !is_null_device(&target) {
-                                let _ = open_redirect_append(&self.session_path(
-                                    shell_path_to_windows(&target, &self.shell_state.env_vars),
-                                ));
-                            }
+                            self.open_append_target_for(Some(redirect), &target)
+                                .map_err(|e| crate::posix_errors::path_error(&target, e))?;
                         }
                         crate::parser::RedirectKind::Output
                         | crate::parser::RedirectKind::ClobberOutput
                         | crate::parser::RedirectKind::CombinedOutput
                         | crate::parser::RedirectKind::CombinedAppend => {
-                            if !is_null_device(&target) {
-                                crate::executor::shell_options::probe_output_redirect(
-                                    self,
-                                    &target,
-                                    redirect.clobber,
-                                )?;
-                            }
+                            crate::executor::shell_options::probe_output_redirect(
+                                self,
+                                Some(redirect),
+                                &target,
+                                redirect.clobber,
+                            )?;
                         }
                         _ => {}
                     }
@@ -2052,17 +2116,31 @@ impl Executor {
                         if redirect.append {
                             self.set_fd_output_file(1, path.to_string(), false, true)
                         } else {
-                            // rubash#1868: probe form — on a FIFO the
-                            // physical create open would consume the
-                            // rendezvous pairing set_fd_output_file's
-                            // bind open waits for (see
-                            // probe_output_redirect).
-                            crate::executor::shell_options::probe_output_redirect(
+                            // rubash#3828: the probe's open IS the
+                            // entry's one open (GNU redir.c
+                            // do_redirection_internal / redir_open) —
+                            // adopt its File as the bind instead of
+                            // opening the target by path again (a
+                            // target created with a mode lacking
+                            // owner-write fails the second open EACCES).
+                            // A FIFO / net / special target probes to
+                            // None and keeps the plain bind below, whose
+                            // open is its single pairing open
+                            // (rubash#1868).
+                            match crate::executor::shell_options::probe_output_redirect_file(
                                 self,
+                                Some(redirect),
                                 path,
                                 redirect.clobber,
-                            )?;
-                            self.set_fd_output_file(1, path.to_string(), false, false)
+                            )? {
+                                Some(file) => self.set_fd_output_file_from_file(
+                                    1,
+                                    path.to_string(),
+                                    false,
+                                    file,
+                                ),
+                                None => self.set_fd_output_file(1, path.to_string(), false, false),
+                            }
                         }
                         .map_err(|error| crate::posix_errors::path_error(path, error))?;
                         self.save_compound_output_fd(saved, 2)?;
@@ -2088,18 +2166,41 @@ impl Executor {
                     let append = redirect.kind == crate::parser::RedirectKind::CombinedAppend;
                     // rubash#1025: same prepare/bind pair as the Output
                     // arm below — consume the prepare phase's record.
-                    // rubash#1868: probe form of the create (FIFO targets
-                    // are access-checked, not opened — the bind open in
-                    // set_fd_output_file is the single pairing open).
-                    if !append && !self.take_noclobber_prepared_target(&target) {
-                        crate::executor::shell_options::probe_output_redirect(
+                    // rubash#3828: the probe's open IS the entry's one
+                    // open — adopt its File as the bind (see the Output
+                    // arm below); a FIFO / net / special target probes
+                    // to None and keeps the plain bind, whose open is
+                    // its single pairing open (rubash#1868).
+                    // rubash#3828: same retained-open adoption as the
+                    // Output arm below — the prepare phase's File is
+                    // this entry's one open.
+                    let pending_fd = self.take_pending_preopened(start + offset, &target);
+                    let probed = if pending_fd.is_none()
+                        && !append
+                        && !self.take_noclobber_prepared_target(&target)
+                    {
+                        crate::executor::shell_options::probe_output_redirect_file(
                             self,
+                            Some(redirect),
                             &target,
                             redirect.clobber,
-                        )?;
+                        )?
+                    } else {
+                        None
+                    };
+                    let opened = match pending_fd {
+                        Some(file_fd) => Some(crate::fd::handle_to_file(
+                            crate::fd::duplicate_handle(file_fd.handle)?,
+                        )),
+                        None => probed,
+                    };
+                    match opened {
+                        Some(file) => {
+                            self.set_fd_output_file_from_file(1, target.clone(), false, file)
+                        }
+                        None => self.set_fd_output_file(1, target.clone(), false, append),
                     }
-                    self.set_fd_output_file(1, target.clone(), false, append)
-                        .map_err(|error| crate::posix_errors::path_error(&target, error))?;
+                    .map_err(|error| crate::posix_errors::path_error(&target, error))?;
                     self.share_fd_output_file(1, 2, &target, false);
                 }
                 // Output | Append | ClobberOutput
@@ -2226,17 +2327,39 @@ impl Executor {
                     // O_EXCL-opened again here — the record is consumed
                     // exactly once, so pre-existing files still fail in
                     // the prepare phase and bind-only scopes keep the
-                    // plain check. rubash#1868: probe form of the create
-                    // (FIFO targets are access-checked, not opened — the
-                    // bind open in set_fd_output_file is the single
-                    // pairing open).
-                    if !redirect.append && !self.take_noclobber_prepared_target(&target) {
-                        crate::executor::shell_options::probe_output_redirect(
+                    // plain check. rubash#3828: the probe's open IS the
+                    // entry's one open — adopt its File as the bind
+                    // below; a FIFO / net / special target probes to
+                    // None and keeps the plain bind, whose open is its
+                    // single pairing open (rubash#1868).
+                    // rubash#3828: the prepare phase's retained open
+                    // IS this entry's one open (GNU do_redirections
+                    // opens each entry once — redir.c
+                    // do_redirection_internal / redir_open) — adopt
+                    // its handle as the bind instead of probing the
+                    // path again, which fails EACCES on a file the
+                    // prepare just created without owner-write
+                    // (umask masking 0200).
+                    let pending_fd = self.take_pending_preopened(start + offset, &target);
+                    let probed = if pending_fd.is_none()
+                        && !redirect.append
+                        && !self.take_noclobber_prepared_target(&target)
+                    {
+                        crate::executor::shell_options::probe_output_redirect_file(
                             self,
+                            Some(redirect),
                             &target,
                             redirect.clobber,
-                        )?;
-                    }
+                        )?
+                    } else {
+                        None
+                    };
+                    let opened = match pending_fd {
+                        Some(file_fd) => Some(crate::fd::handle_to_file(
+                            crate::fd::duplicate_handle(file_fd.handle)?,
+                        )),
+                        None => probed,
+                    };
                     // GNU redir.c do_redirection_internal: every `>file`
                     // redirection performs its OWN open() — `>f 2>f` binds
                     // two independent open file descriptions with
@@ -2251,8 +2374,13 @@ impl Executor {
                     // through a plain `2>f` binding take the same
                     // independent-offset semantics as GNU's second open.
                     let append = redirect.append;
-                    self.set_fd_output_file(fd, target.clone(), fd >= 10, append)
-                        .map_err(|error| crate::posix_errors::path_error(&target, error))?;
+                    match opened {
+                        Some(file) => {
+                            self.set_fd_output_file_from_file(fd, target.clone(), fd >= 10, file)
+                        }
+                        None => self.set_fd_output_file(fd, target.clone(), fd >= 10, append),
+                    }
+                    .map_err(|error| crate::posix_errors::path_error(&target, error))?;
                 }
             }
         }
@@ -2283,6 +2411,11 @@ impl Executor {
         for saved in saved {
             match saved.entry {
                 Some(entry) => {
+                    // rubash#3938 face C: land the saved entry back
+                    // onto its kernel number (GNU's undo replays a
+                    // r_move record: dup2 the save back, close it —
+                    // redir.c:1399 add_undo_fd_redirect).
+                    let entry = self.fd_table.land_restored_entry(saved.fd, entry);
                     self.fd_table.entries.insert(saved.fd, entry);
                 }
                 None => {
@@ -2357,7 +2490,10 @@ impl Executor {
         cmd.heredoc_redirects
             .iter()
             .rev()
-            .find(|redirect| redirect.fd.is_none())
+            // GNU redir.c:963-968 (REDIR_VARASSIGN): a `{var}<<` twin
+            // binds a freshly allocated descriptor, never fd 0 — it is
+            // not this command's stdin body (rubash#3894).
+            .find(|redirect| redirect.fd_var.is_none() && redirect.fd.is_none())
             .map(|redirect| {
                 if redirect.body_carrier.is_some() {
                     if redirect.here_string {
@@ -2845,8 +2981,18 @@ impl Executor {
         let target = self.expand_redirect_target(redirect);
         if super::execution_misc::is_closed_redirect_target(&target)
             || super::execution_misc::dev_stdio_redirect_fd(&target).is_some()
-            || is_null_device(&target)
         {
+            return None;
+        }
+        // rubash#3815: on Unix /dev/null is an ordinary file open
+        // (redir.c redir_open) — let it reach the stream-source
+        // class below, which admits character devices, so the
+        // compound's fd 0 binds a real descriptor instead of the
+        // empty text mirror (children would otherwise see a
+        // carrier, not /dev/null). Windows keeps declining it:
+        // NUL is not a filesystem object there.
+        #[cfg(not(unix))]
+        if is_null_device(&target) {
             return None;
         }
         if crate::special_paths::synthetic_proc_content(&target).is_some() {
@@ -3220,7 +3366,8 @@ impl Executor {
     /// order and stops at the first failing step (redir.c:255-260): the
     /// first `M>&N`/`M<&N` (or `M>&N-`/`M<&N-` move) whose source fd N is
     /// not open — judged with the same opened/closed tracking as the
-    /// simple-command preflight (`command_output_redirect_fails` /
+    /// simple-command preflight
+    /// (`command_output_redirect_fails_with_preopened` /
     /// `dup_source_fd_open`) — returns `(index, diagnostic name)`. Pure:
     /// opens nothing, dups nothing.
     ///

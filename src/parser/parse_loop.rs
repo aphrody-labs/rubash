@@ -870,6 +870,32 @@ fn fold_inverted_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
         .collect()
 }
 
+/// rubash#3949: a trailing `&` on a coproc is a redundant terminator,
+/// not a backgrounding operator. GNU's `coproc` is already
+/// asynchronous: execute_connection '&' (execute_cmd.c:2822-2845)
+/// runs the first command with asynchronous=1, and
+/// execute_command_internal dispatches cm_coproc BEFORE any
+/// async/subshell fork (execute_cmd.c:666-668), so execute_coproc
+/// runs in the parent, binds COPROC/COPROC_PID there (coproc_setvars,
+/// execute_cmd.c:2566) and $! equals $COPROC_PID. The `&` therefore
+/// must not fold the coproc into a background_command wrapper: the
+/// wrapper respawns the whole setup in a child `rubash -c`, and the
+/// parent never sees COPROC. A `time` frame (or chain of them) between
+/// the `&` and the coproc changes nothing — GNU reaches the same
+/// cm_coproc dispatch through the time frame — so the walk follows
+/// time_command links to the head. Every other shape still wraps:
+/// a coproc inside a pipeline (`coproc cat | cat &`, rubash#2895),
+/// a group/subshell (`{ coproc cat; } &`), or an and-or list is
+/// backgrounded as a whole in GNU too, and the parent rightly never
+/// sees COPROC there.
+fn background_command_head_is_coproc(command: &CommandNode) -> bool {
+    let mut head = command;
+    while let Some(time_command) = &head.time_command {
+        head = &time_command.command;
+    }
+    head.coproc_command.is_some()
+}
+
 fn fold_background_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
     commands
         .into_iter()
@@ -879,6 +905,9 @@ fn fold_background_commands(commands: Vec<CommandNode>) -> Vec<CommandNode> {
             }
 
             command.background = false;
+            if background_command_head_is_coproc(&command) {
+                return command;
+            }
             let line = command.line;
             let mut background = CommandNode::new();
             background.line = line;
@@ -3397,6 +3426,24 @@ fn if_frame_offender(region: &[Token]) -> Option<usize> {
         }
         if token.kind == TokenKind::Keyword {
             let value = token.value.trim_end();
+            // A folded arithmetic command is a COMMAND, never a phase
+            // keyword: the parse_dparen fold keeps the whole `((…))' in
+            // a single Keyword token (the same shape
+            // push_unexpected_token_error_named special-cases for
+            // rubash#3204), and GNU's grammar accepts it wherever a
+            // command is accepted (parse.y:1203 arith_command). The
+            // phase-keyword legality check below would otherwise blame
+            // it as the offender — `if ((1))' at EOF named `((1))'
+            // instead of the `if' EOF report (rubash#3184). At our own
+            // frame level it plays the word token's role: the phase's
+            // command.
+            if token.value.starts_with("((") && token.value.ends_with("))") {
+                if stack.len() == 1 {
+                    expect_command = false;
+                    phase_has_command = true;
+                }
+                continue;
+            }
             // A compound command opener at our own frame level starts a
             // command (`if (x); fi` ⇒ the missing `then` blames `fi`).
             if stack.len() == 1 {

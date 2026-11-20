@@ -173,6 +173,19 @@ pub(super) struct ConditionalArithParser<'a> {
     pub(super) cells: Option<&'a crate::shell::VariableStore>,
     pub(super) error_category: Option<super::ArithmeticErrorCategory>,
     pub(super) no_expand: bool,
+    /// Whether the expression text reaching this parser was already
+    /// expand_arith_string'd by its entry (GNU `(( ))`, `$(( ))` and
+    /// `[[ ]]` arithcomp run expand_arith_string before evalexp, while
+    /// `let` operands arrive EXP_EXPANDED without it): a subscript
+    /// whose expansion is empty is the empty-bracket token `name[]`
+    /// (arrayfunc.c array_variable_name fails it, expr.c:1183/1224
+    /// diagnose it twice) only in the former; in the latter the same
+    /// empty expansion is array_expand_index's index 0 (rubash#3252 —
+    /// `let 'b[$undef]++'` binds b[0] silently). Nested frames
+    /// (variable-value recursion, subscript evalexp) always run false:
+    /// their input text reaches subexpr verbatim (expr.c:1241), so a
+    /// non-empty bracket span there never diagnoses on expansion.
+    pub(super) expanded_entry: bool,
     /// The first recorded evalerror — GNU longjmps on the first failure, so
     /// later diagnostics never overwrite it.
     pub(super) error: Option<ArithEvalError>,
@@ -316,6 +329,14 @@ pub(super) enum ArithLValue {
     },
     Indexed {
         name: String,
+        /// The array name exactly as written in the expression. GNU
+        /// expr.c:1190-1194 checks the RESOLVED cell for the nounset
+        /// verdict (array_variable_part follows the nameref) but the
+        /// diagnostic names the reference as written
+        /// (array_variable_name cuts the token at `[` without resolving),
+        /// so a read through `declare -n r=zz` reports `r`, not `zz`
+        /// (rubash#3563).
+        written: String,
         index: i128,
         /// The full `name[sub]` token text as written, for the bind-time
         /// diagnostic: GNU's assign path reports the lvalue token verbatim
@@ -330,10 +351,14 @@ pub(super) enum ArithLValue {
     /// `a[n]=++n`) are visible to the subscript.
     IndexedRaw {
         name: String,
+        /// The array name exactly as written (see `Indexed::written`).
+        written: String,
         subscript: String,
     },
     Assoc {
         name: String,
+        /// The array name exactly as written (see `Indexed::written`).
+        written: String,
         key: String,
     },
     /// An associative lvalue whose bracket text is NONEMPTY but whose
@@ -346,6 +371,8 @@ pub(super) enum ArithLValue {
     /// nothing (arrayfunc.c:402-407), and the expression value is 0.
     AssocEmptyKey {
         name: String,
+        /// The array name exactly as written (see `Indexed::written`).
+        written: String,
         /// The `name[sub]` token text for the bind-time diagnostic.
         bind_display: String,
     },
@@ -354,14 +381,25 @@ pub(super) enum ArithLValue {
     /// and binds report `` `name[]': not a valid identifier `` while the
     /// expression keeps evaluating (verified GNU 5.3: `(( a[]=24 ))`
     /// reports the diagnostic, assigns nothing, and yields status 0).
-    InvalidElement {
-        display: String,
-    },
+    InvalidElement { display: String },
     /// `name[@]` / `name[*]` on an indexed array in arithmetic context —
     /// GNU array_expand_index (arrayfunc.c) rejects the `@`/`*` subscript
     /// with `name[@]: bad array subscript` and the reference reads as 0;
     /// a bind diagnoses once more and stores nothing (rubash#1136).
-    BadSubscriptElement {
-        display: String,
-    },
+    BadSubscriptElement { display: String },
+}
+
+/// Outcome of evaluating a raw indexed subscript
+/// (`eval_subscript_index`, value.rs): a concrete index, or the
+/// empty-bracket token — the subscript expanded to empty text in an
+/// entry that had already run expand_arith_string, so the STR token
+/// reaching evalexp is `name[]` and GNU's array_variable_name check
+/// (arrayfunc.c:1405-1416, `ni <= ind + 1`) fails it before any index
+/// is computed (rubash#3252). Callers convert `Empty` into the
+/// `InvalidElement` shape (reads diagnose twice, binds fail as
+/// `` `name[]': not a valid identifier ``); a plain `Value(0)` keeps
+/// the array_expand_index law (empty expansion is index 0).
+pub(super) enum SubscriptIndex {
+    Value(i128),
+    Empty,
 }

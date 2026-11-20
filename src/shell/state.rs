@@ -260,6 +260,11 @@ pub struct ShellState {
     pub(crate) history_comment_char_armed: bool,
     /// alias.c aliases.
     pub(crate) aliases: HashMap<String, Alias>,
+    /// Non-counting newline byte offsets for pre-expanded `$(...)` /
+    /// `${ ... }` comsub bodies (rubash#3838): the pre-pass expands
+    /// comsub bodies at parse time, so runtime `tokenize_comsub_body`
+    /// needs to know which `\n`s were introduced by alias expansion.
+    pub(crate) comsub_alias_newlines: HashMap<String, Vec<usize>>,
     /// variables.c shell_functions.
     pub(crate) functions: HashMap<String, FunctionBody>,
     /// Redirect words parsed at function definition time, applied at call.
@@ -311,6 +316,22 @@ pub struct ShellState {
     /// (get_bashargcv) during a read, where the executor is shared.
     /// None while the arrays have never been initialized.
     pub(crate) bash_arg_bottom: std::cell::RefCell<Option<Vec<String>>>,
+    /// rubash#3909: GNU variables.c `bash_argv_initialized` — the third
+    /// state of the BASH_ARGV/BASH_ARGC bottom frame. `bash_arg_bottom`
+    /// alone cannot tell "never initialized" (None, a top-level read
+    /// must synthesize from the live window) from "initialized with no
+    /// frame" (None, a top-level read must show ()). The flag is set
+    /// exactly where GNU sets it: by `init_bash_argv`
+    /// (variables.c:5640-5650, which sets it even when the push is a
+    /// no-op because the arrays do not exist yet), by the startup
+    /// bind (shell.c:1504-1529 `bind_args` sets it when it pushes a
+    /// frame), and by the startup extdebug arming sites (which run
+    /// before any binding, mirroring run_shopt_alist shell.c:576). It
+    /// is never cleared — not by `shopt -u extdebug`, not by a
+    /// rebind — exactly like GNU's. A Cell because the flag is read
+    /// from shared-executor paths (the getter, function entry) and
+    /// ShellState is already !Sync.
+    pub(crate) bash_argv_initialized: std::cell::Cell<bool>,
     /// rubash#2973: the materialized CELL contents of the getter-
     /// backed dynamic variables (variables.c INIT_DYNAMIC_VAR). GNU
     /// dynamics are real shell_variable cells: a by-name read fires
@@ -958,6 +979,13 @@ impl InteriorSnapshot {
 }
 
 impl ShellState {
+    pub(crate) fn record_comsub_alias_newlines(&mut self, records: Vec<(String, Vec<usize>)>) {
+        for (body, marks) in records {
+            if !marks.is_empty() {
+                self.comsub_alias_newlines.insert(body, marks);
+            }
+        }
+    }
     /// Live positional window (`shift`-visible `$1..$#`): the storage tail
     /// starting at `positional_offset`. GNU keeps the whole `list` and
     /// moves `loptend` (bash variables.c); every reader must go through
@@ -1109,6 +1137,7 @@ impl Clone for ShellState {
             forced_interactive: self.forced_interactive,
             history_comment_char_armed: self.history_comment_char_armed,
             aliases: self.aliases.clone(),
+            comsub_alias_newlines: self.comsub_alias_newlines.clone(),
             functions: self.functions.clone(),
             function_definition_redirects: self.function_definition_redirects.clone(),
             function_def_infos: self.function_def_infos.clone(),
@@ -1121,6 +1150,7 @@ impl Clone for ShellState {
             bash_argc_stack: self.bash_argc_stack.clone(),
             bash_argv_stack: self.bash_argv_stack.clone(),
             bash_arg_bottom: self.bash_arg_bottom.clone(),
+            bash_argv_initialized: std::cell::Cell::new(self.bash_argv_initialized.get()),
             dynamic_cells: self.dynamic_cells.clone(),
             bash_lineno_stack: self.bash_lineno_stack.clone(),
             bash_source_stack: self.bash_source_stack.clone(),

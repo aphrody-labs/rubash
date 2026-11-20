@@ -219,7 +219,13 @@ impl Executor {
                         // its trap already dispatched — the command's
                         // status is the signal death 128+sig, like GNU
                         // reaping a real sleep killed the same way.
-                        match self.sleep_interruptibly(seconds)? {
+                        // rubash#3467: Some(20) is the other Some shape
+                        // on non-unix — the virtual sleep was STOPPED,
+                        // its sleeper child materialized and parked as
+                        // the stopped job; the status is still 128+sig
+                        // and the list continues.
+                        let command_text = self.signal_notice_command_text(cmd);
+                        match self.sleep_interruptibly(seconds, &command_text)? {
                             Some(signal) => {
                                 self.exit_code = 128 + signal;
                                 // rubash#1639: an UNTRAPPED SIGINT abort
@@ -292,14 +298,19 @@ impl Executor {
                 }
             }
             Some(PrimarySlot::Env) => {
-                // #2036 S2 (KD-1): env is in BUILTIN_NAMES and, now
-                // that enable's list projects from the same registry,
-                // it is enable-managed like every other builtin. The
-                // per-arm `enable -n` check the sibling arms carry was
-                // never wired here (enable refused the name outright,
-                // so the disabled set could never contain it); without
-                // it, `enable -n env` would report success while
-                // dispatch ignored the disable.
+                // rubash#3951: `env` is an emulated external command,
+                // not a builtin (GNU has no env builtin — no
+                // builtins/env.def; env is coreutils). The
+                // in-process implementation (execute_env_command) is
+                // the only env on platforms without /usr/bin/env, so
+                // the simple-command face still answers with it. It
+                // is NOT enable-managed: `enable -n env` fails (the
+                // name is not in the builtin table), so the disabled
+                // set can never contain it through enable; the check
+                // below only fires if the carrier was populated
+                // out-of-band (e.g. inherited from an older shell),
+                // in which case dispatch falls through to the PATH
+                // body like every other disabled builtin.
                 if crate::builtins::enable::is_disabled(&self.shell_state.env_vars, "env") {
                     self.execute_external(cmd)
                 } else {

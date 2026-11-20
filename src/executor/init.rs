@@ -91,6 +91,132 @@ pub const RESPAWN_SPAWNER_PID_KEY: &str = "__RUBASH_SPAWNER_PID";
 /// (the #2521 regression of the #2333 restore).
 pub const FD_DELIVERY_AT_STAMPED_KEY: &str = "__RUBASH_FD_AT_STAMPED";
 
+/// rubash#3300: transport keys for the per-spawn fd/pipe provenance
+/// proof (DESIGN.md in ~/workspace/fix-3300). Every fork-shaped
+/// respawn mints a fresh anonymous pipe holding a fresh 16-byte nonce
+/// (32 hex chars) and hands the child the read end at a spawner-chosen
+/// number >= 100 plus these two keys. The keys are per-spawn proof,
+/// not fork-context state: they are NEVER added to
+/// FORK_TRANSPORT_KEYS or rubash_spawn_inherited_state, never
+/// forwarded to grandchildren (a grandchild's proof is minted fresh
+/// by its own spawner), and never surface as shell variables — they
+/// are consumed at entry with the other transport keys below.
+pub const RESPAWN_PROOF_FD_KEY: &str = "__RUBASH_RESPAWN_PROOF_FD";
+pub const RESPAWN_PROOF_KEY: &str = "__RUBASH_RESPAWN_PROOF";
+
+/// rubash#3300: the respawn proof verdict, computed exactly once per
+/// process. The helper is called from both entry paths — main.rs's
+/// async-child entry (before any Executor exists) and
+/// `Executor::new_inner` — and the second call must not re-read or
+/// re-close the fd: the pipe is drained on first validation, so a
+/// second validation would see EOF and report a false negative. The
+/// verdict is a property of this process's birth, not of each
+/// Executor, so one process-global cache is the correct shape.
+#[cfg(unix)]
+static RESPAWN_PROOF_VALIDATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// rubash#3300: read the two proof keys from the process env,
+/// validate the pipe, close it on success, remove the keys from the
+/// process env (they are transport keys, consumed at entry, never to
+/// surface as shell variables or ride the mirror into children), and
+/// cache the verdict. Returns false on every failure shape, including
+/// absent keys — a child spawned without proof simply takes the old
+/// two arms of `respawn_provenance_validated`.
+#[cfg(unix)]
+fn respawn_proof_validated() -> bool {
+    *RESPAWN_PROOF_VALIDATED.get_or_init(|| {
+        let fd = std::env::var(RESPAWN_PROOF_FD_KEY)
+            .ok()
+            .and_then(|v| v.parse::<std::os::unix::io::RawFd>().ok());
+        let nonce = std::env::var(RESPAWN_PROOF_KEY).ok();
+        // Remove the keys either way: even a failed proof leaves
+        // nothing behind for a grandchild to inherit or a variable
+        // table to import.
+        mirror_env_remove(RESPAWN_PROOF_FD_KEY);
+        mirror_env_remove(RESPAWN_PROOF_KEY);
+        let Some(fd) = fd else {
+            return false;
+        };
+        let Some(nonce) = nonce else {
+            return false;
+        };
+        if fd < 0 || !validate_respawn_proof_fd(fd, &nonce) {
+            // Failed validation leaves the fd open as an ordinary
+            // inherited fd (the #1557 rule: an unclaimed fd is
+            // adopted, never closed).
+            return false;
+        }
+        // Success owns the fd: close it so the proof cannot be
+        // re-read, replayed, or inherited by a grandchild.
+        unsafe {
+            libc::close(fd);
+        }
+        true
+    })
+}
+
+#[cfg(not(unix))]
+fn respawn_proof_validated() -> bool {
+    false
+}
+
+/// rubash#3300: validate the proof pipe named by `fd` against the
+/// 16-byte `nonce` (32 hex chars). Every step must hold:
+/// fstat says FIFO (not a file, socket, or tty a hostile parent
+/// pre-planted); O_NONBLOCK first, so a hostile fd can never hang
+/// entry; exactly 16 bytes read and equal to the nonce; the next read
+/// must be EOF — the spawner closed the write end before spawn, so
+/// EOF is what distinguishes this pipe (write end already gone) from
+/// any pipe a hostile parent still holds open. Returns false on every
+/// failure shape; never closes `fd` (the caller owns that decision).
+#[cfg(unix)]
+fn validate_respawn_proof_fd(fd: std::os::unix::io::RawFd, nonce_hex: &str) -> bool {
+    let Some(want) = crate::fd::respawn_proof_nonce_bytes(nonce_hex) else {
+        return false;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    if (u32::from(st.st_mode) & u32::from(libc::S_IFMT)) != u32::from(libc::S_IFIFO) {
+        return false;
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return false;
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    let mut got = 0;
+    while got < 16 {
+        let n = unsafe { libc::read(fd, buf[got..].as_mut_ptr() as *mut libc::c_void, 16 - got) };
+        if n == 0 {
+            return false; // EOF before 16 bytes: not our pipe.
+        }
+        if n < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error();
+            if e == Some(libc::EINTR) {
+                continue;
+            }
+            // EAGAIN: no data yet — the write end is still open (or
+            // the pipe is empty), so this is not a mint-closed proof.
+            return false;
+        }
+        got += n as usize;
+    }
+    if buf != want {
+        return false;
+    }
+    // Second read must be EOF: the spawner closed the write end
+    // before spawn. Extra data, or EAGAIN (write end still open),
+    // both fail.
+    let mut extra = [0u8; 1];
+    let n = unsafe { libc::read(fd, extra.as_mut_ptr() as *mut libc::c_void, 1) };
+    n == 0
+}
+
 /// The parent process id of this process, where the platform exposes it
 /// cheaply. Windows enumerates a Toolhelp snapshot, so callers invoke
 /// this only when a provenance claim is actually present.
@@ -261,8 +387,15 @@ fn stamped_spawner_gone(pid: u32, stamp_start: Option<u64>) -> bool {
 /// * the stamp names our live parent (`getppid()`), or
 /// * we were orphaned to the namespace init (ppid 1) and the stamped
 ///   spawner is gone — the async child whose shell exited while it
-///   started. A live unrelated parent fails both arms, which is what
-///   makes a leaked or planted claim in a normal session inert.
+///   started, or
+/// * (rubash#3300) we were orphaned to a live unrelated parent — a
+///   subreaper that adopted us after our spawner died — and we hold a
+///   valid per-spawn fd/pipe proof (`proof_valid`): the pipe is
+///   unforgeable evidence that the stamped spawner really spawned us,
+///   which no ppid value can supply after reparenting. The proof arm
+///   still requires the stamped spawner to be gone, so a live
+///   unrelated parent with a planted claim and no proof fails every
+///   arm, exactly as before.
 ///
 /// A parent that deliberately stamps its own pid is in the same trust
 /// class GNU extends to BASH_ENV/SHELLOPTS: it already controls the
@@ -270,6 +403,7 @@ fn stamped_spawner_gone(pid: u32, stamp_start: Option<u64>) -> bool {
 pub(crate) fn respawn_provenance_validated(
     claim_present: bool,
     spawner_stamp: Option<(u32, Option<u64>)>,
+    proof_valid: bool,
 ) -> bool {
     if !claim_present {
         return false;
@@ -280,7 +414,13 @@ pub(crate) fn respawn_provenance_validated(
     match parent_process_id() {
         Some(ppid) if ppid == stamp_pid => true,
         Some(1) => stamped_spawner_gone(stamp_pid, stamp_start),
-        _ => false,
+        // rubash#3300: orphaned to a live unrelated parent (a
+        // subreaper, not init). The ppid cannot testify here, so the
+        // per-spawn fd/pipe proof carries the verdict — but only
+        // together with the stamped spawner being gone. Never relax
+        // this arm to any ppid: that would reopen the #2136 stranger
+        // hole the first two arms closed.
+        _ => proof_valid && stamped_spawner_gone(stamp_pid, stamp_start),
     }
 }
 
@@ -293,7 +433,10 @@ pub fn respawn_provenance_validated_from_process_env() -> bool {
     let stamp = std::env::var(RESPAWN_SPAWNER_PID_KEY)
         .ok()
         .and_then(|value| parse_spawner_stamp(&value));
-    respawn_provenance_validated(claim, stamp)
+    // rubash#3300: the proof verdict comes from the OnceLock helper —
+    // exactly once per process, even though this form and new_inner
+    // below both ask for it.
+    respawn_provenance_validated(claim, stamp, respawn_proof_validated())
 }
 
 impl Executor {
@@ -385,7 +528,31 @@ impl Executor {
         let spawner_stamp = raw_env
             .get(RESPAWN_SPAWNER_PID_KEY)
             .and_then(|value| parse_spawner_stamp(value));
-        let internal_respawn = respawn_provenance_validated(provenance_claim, spawner_stamp);
+        let internal_respawn = respawn_provenance_validated(
+            provenance_claim,
+            spawner_stamp,
+            respawn_proof_validated(),
+        );
+        // rubash#3932: the respawn payload face — the -c body's GNU
+        // nofork face (simple async / subshell body / process-substitution
+        // body) the spawn site transported. Consumed only by a validated
+        // internal respawn; stripped unconditionally so a forged ambient
+        // key arms nothing and never surfaces as a variable or export.
+        let respawn_payload_face = if internal_respawn {
+            match raw_env
+                .get(crate::builtins::kill::BACKGROUND_WRAPPER_PAYLOAD_FACE_KEY)
+                .map(String::as_str)
+            {
+                Some("simple") => 1u8,
+                Some("subshell") => 2u8,
+                Some("procsub") => 3u8,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        raw_env.remove(crate::builtins::kill::BACKGROUND_WRAPPER_PAYLOAD_FACE_KEY);
+        mirror_env_remove(crate::builtins::kill::BACKGROUND_WRAPPER_PAYLOAD_FACE_KEY);
         if !internal_respawn {
             let foreign: Vec<String> = raw_env
                 .keys()
@@ -915,13 +1082,13 @@ impl Executor {
                     // (the spawn stamp there falls back to the
                     // unstamped spawn, as before).
                     #[cfg(unix)]
-                    let anchor =
-                        std::fs::File::open(".")
-                            .ok()
-                            .map(|dir| crate::shell::state::CwdAnchor {
-                                path: field.clone(),
-                                dir: std::sync::Arc::new(dir),
-                            });
+                    let anchor = std::fs::File::open(".")
+                        .ok()
+                        .map(crate::fd::move_file_to_high_fd)
+                        .map(|dir| crate::shell::state::CwdAnchor {
+                            path: field.clone(),
+                            dir: std::sync::Arc::new(dir),
+                        });
                     #[cfg(not(unix))]
                     let anchor: Option<crate::shell::state::CwdAnchor> = None;
                     (field, anchor)
@@ -1036,6 +1203,10 @@ impl Executor {
         let mut respawn_root_line_spans: Option<(usize, Vec<crate::parser::CommandLineSpan>)> =
             None;
         let mut respawn_argv_bottom: Option<Vec<String>> = None;
+        // rubash#3909: the bash_argv_initialized flag from the
+        // __RUBASH_FORK_BASH_ARGV_INITIALIZED stamp; false unless the
+        // parent stamped it (see the transport doc).
+        let mut respawn_bash_argv_initialized: bool = false;
         let mut respawn_pipestatus: Option<(
             crate::shell::state::PipestatusShape,
             Vec<(i64, i32)>,
@@ -1064,6 +1235,11 @@ impl Executor {
             // materialized empty frame, absent is unmaterialized.
             if let Some(value) = env_vars.get(super::compound_exec::FORK_ARGV_BOTTOM_TRANSPORT) {
                 respawn_argv_bottom = Some(array_values(value));
+            }
+            // rubash#3909: presence is the flag bit (see the
+            // FORK_BASH_ARGV_INITIALIZED_TRANSPORT doc).
+            if env_vars.contains_key(super::compound_exec::FORK_BASH_ARGV_INITIALIZED_TRANSPORT) {
+                respawn_bash_argv_initialized = true;
             }
             if let Some(value) = env_vars.get(super::compound_exec::FORK_PIPESTATUS_TRANSPORT) {
                 respawn_pipestatus = crate::shell::state::decode_pipestatus_state(value);
@@ -1115,6 +1291,19 @@ impl Executor {
         let fd_delivery_at_stamped =
             env_vars.remove(FD_DELIVERY_AT_STAMPED_KEY).as_deref() == Some("1");
         mirror_env_remove(FD_DELIVERY_AT_STAMPED_KEY);
+        // rubash#3300: the respawn proof keys are consumed here with
+        // the other transport keys so they never surface as shell
+        // variables or ride the process-env mirror into children. The
+        // OnceLock helper already removed the process-env copies at
+        // first validation; this removes the imported-table copies the
+        // construction-start snapshot may still carry. (Deliberately
+        // NOT in FORK_TRANSPORT_KEYS: the proof is per-spawn, never
+        // forwarded — a grandchild's proof is minted fresh by its own
+        // spawner.)
+        env_vars.remove(RESPAWN_PROOF_FD_KEY);
+        env_vars.remove(RESPAWN_PROOF_KEY);
+        mirror_env_remove(RESPAWN_PROOF_FD_KEY);
+        mirror_env_remove(RESPAWN_PROOF_KEY);
 
         // Forked-child fd table restore: a `rubash -c` background/subshell
         // child inherits the parent's fd>=3 File endpoints through the
@@ -1204,7 +1393,12 @@ impl Executor {
 
         let mut executor = Self {
             shell_state: ShellState {
-                variables: VariableStore::from_environment(&env_vars),
+                // rubash#3108: bind from the table with its attribute
+                // provenance, not as a raw environment — the table is
+                // already seeded with the shell's own variables, and
+                // only the genuinely imported entries are exported
+                // (variables.c:511-518).
+                variables: VariableStore::from_var_table(&env_vars),
                 env_vars,
                 // G-02: a root session is born in the process cwd (the
                 // host's directory at Executor::new, exactly what GNU's
@@ -1276,6 +1470,10 @@ impl Executor {
                 // respawn verbatim; None keeps the arrays unmaterialized
                 // exactly as the parent's fork left them.
                 bash_arg_bottom: std::cell::RefCell::new(respawn_argv_bottom),
+                // rubash#3909: the flag crosses with the frame — a
+                // flag-set/bottom-None parent must not become a
+                // synthesizing child (see the transport doc).
+                bash_argv_initialized: std::cell::Cell::new(respawn_bash_argv_initialized),
                 dynamic_cells: std::cell::RefCell::new(
                     crate::shell::state::DynamicCellState::default(),
                 ),
@@ -1297,6 +1495,7 @@ impl Executor {
                 local_attr_scopes: Vec::new(),
                 local_typed_scopes: Vec::new(),
                 expanding_aliases: Vec::new(),
+                comsub_alias_newlines: std::collections::HashMap::new(),
                 loop_depth: 0,
                 inherited_loop_depth: 0,
                 subshell_saved_loop_depth: 0,
@@ -1409,6 +1608,8 @@ impl Executor {
             reap_prev_mark: Cell::new((0, None, 0)),
             execute_generation: Cell::new(0),
             foreground_wait_count: Cell::new(0),
+            disposal_wait_count: Cell::new(0),
+            disposal_prev_mark: Cell::new(0),
             coproc_stderr_forwarders: HashMap::new(),
             coproc_displaced_stdout_writers: HashMap::new(),
             assignment_output_process_substitutions: Vec::new(),
@@ -1429,6 +1630,7 @@ impl Executor {
             parse_and_execute_frames: Vec::new(),
             command_builtin_depth: 0,
             builtin_wrapper_depth: 0,
+            compound_redirect_scope_depth: 0,
             standard_path_scope: None,
             debug_trap_running: false,
             debug_action_running: false,
@@ -1511,6 +1713,15 @@ impl Executor {
             exec_replace_stamp_counter: Cell::new(0),
             exec_replace_stamp_hold: Cell::new(0),
             exec_replace_shlvl_snapshot: Cell::new(None),
+            nofork_spawn_dispatch_stamp: Cell::new(0),
+            nofork_spawn_stamp_counter: Cell::new(0),
+            nofork_spawn_stamp_hold: Cell::new(0),
+            nofork_spawn_body_candidate_pending: Cell::new(false),
+            nofork_spawn_body_candidate: Cell::new(false),
+            nofork_spawn_face_allows_redirects: Cell::new(false),
+            nofork_spawn_face_unconditional: Cell::new(false),
+            nofork_spawn_face_child_trap_reset: Cell::new(false),
+            respawn_payload_face: Cell::new(respawn_payload_face),
             line_lex_locales: std::cell::RefCell::new(HashMap::new()),
             unit_lex_locale: std::cell::RefCell::new(None),
             line_lex_extquotes: std::cell::RefCell::new(HashMap::new()),
@@ -1544,6 +1755,9 @@ impl Executor {
             last_command_inverted: Cell::new(false),
             compound_redirect_failed: Cell::new(false),
             noclobber_prepared_targets: std::cell::RefCell::new(std::collections::HashSet::new()),
+            pending_preopened_redirects: std::cell::RefCell::new(std::collections::HashMap::new()),
+            preopened_pending_preserved_once: std::cell::Cell::new(false),
+            preopened_generation: std::cell::Cell::new(0),
             exit_jump_pending: Cell::new(false),
             run_diagnostics: std::cell::RefCell::new(None),
             errexit_status_converted: Cell::new(false),
@@ -1575,6 +1789,7 @@ impl Executor {
             read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
             read_process_stdin_eof: false,
+            read_delim_word_byte: None,
             read_edit_armed: false,
             read_edit_initial_text: None,
             read_edit_prompt: None,
@@ -1645,6 +1860,7 @@ impl Executor {
                 Rc::new(FileFd {
                     handle: restore_handle(handle),
                     closed: std::cell::Cell::new(false),
+                    adopted: false,
                     path: path.clone(),
                 })
             });
@@ -1656,6 +1872,7 @@ impl Executor {
                     _ => Some(Rc::new(FileFd {
                         handle: restore_handle(handle),
                         closed: std::cell::Cell::new(false),
+                        adopted: false,
                         path: path.clone(),
                     })),
                 },
@@ -1755,6 +1972,30 @@ impl Executor {
         // imported PWD keeps its stale value and an absent one stays
         // unbound; no logical value is adopted either — the readers
         // gate on the empty field itself.
+        // rubash#3347: a validated internal respawn (keep_shlvl) is
+        // GNU's forked child — its tcwd is the spawner's logical cwd,
+        // carried in the fork-context stamp (LOGICAL_CWD_TRANSPORT),
+        // not re-derived from the exported $PWD. Adopt the transported
+        // value verbatim once it still names this session's cwd (the
+        // same_file judgment variables.c:907 set_pwd applies, in the
+        // runtime form logical_value_names_cwd); any other value —
+        // stale, foreign, or naming another directory — falls through
+        // to the $PWD adoption below. A fresh shell (keep_shlvl false:
+        // explicit `-c`, script file, top-level) is a fresh exec in
+        // GNU too and keeps adopting from $PWD. The key itself is
+        // stripped by the FORK_TRANSPORT_KEYS sweep in Executor::new,
+        // so it never surfaces as a shell variable.
+        let transported_logical_cwd = if keep_shlvl {
+            env_vars
+                .get(crate::executor::compound_exec::LOGICAL_CWD_TRANSPORT)
+                .cloned()
+                .filter(|value| {
+                    !value.is_empty()
+                        && crate::builtins::pwd::logical_value_names_cwd(value, cwd, env_vars)
+                })
+        } else {
+            None
+        };
         // rubash#3570: the `\`→`/` rewrite is a Windows path-form
         // normalization — on Unix a backslash is an ordinary filename byte
         // (general.h:264-270 ABSPATH), and GNU set_pwd (variables.c:907)
@@ -1766,6 +2007,8 @@ impl Executor {
         let physical_pwd = shell_pwd_display(cwd.to_string_lossy().as_ref());
         let startup_logical_cwd = if cwd.as_os_str().is_empty() {
             String::new()
+        } else if let Some(logical) = transported_logical_cwd {
+            logical
         } else {
             match crate::builtins::pwd::adopted_logical_pwd(env_vars, cwd) {
                 Some(logical) => logical,

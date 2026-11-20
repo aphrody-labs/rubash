@@ -943,6 +943,30 @@ pub(crate) fn escape_marker_zone_chars(text: &str) -> String {
     output
 }
 
+/// Display-boundary spelling for a decoded (visible) value (rubash#3921
+/// rework): re-spell as transport text ONLY when the downstream flush
+/// decode will run. `declare -p` output leaves the shell through the
+/// stdout flush, whose decode (`decode_raw_byte_marker_bytes`) runs only
+/// when the chunk contains a bare U+E000 — otherwise it returns the chunk
+/// unchanged. Feeding transport text unconditionally (the PR's blanket
+/// escape) is correct only when the visible text contains U+E000: then the
+/// flush decodes the pairs exactly once and the glyphs round-trip. When
+/// the visible text has no U+E000 the flush never decodes, so the E400
+/// introducers leak verbatim in front of every glyph (rubash#2884/#824/
+/// #843: `declare -p` showed `U+E400 U+E301` for a stored `U+E301`).
+/// With no U+E000 the visible text is already the final spelling — feed
+/// it as-is (the pre-PR behaviour, which the flush leaves untouched).
+pub(crate) fn escape_marker_zone_chars_for_display(visible: &str) -> String {
+    if visible
+        .chars()
+        .any(|ch| ch as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE)
+    {
+        escape_marker_zone_chars(visible)
+    } else {
+        visible.to_string()
+    }
+}
+
 #[allow(dead_code)]
 pub(in crate::executor) fn split_expanded_fragments(
     fragments: &[ExpandedFragment],
@@ -1244,6 +1268,35 @@ pub(in crate::executor) fn scan_substitution_spans(raw: &str) -> Vec<Substitutio
                             continue;
                         }
                     }
+                    // ANSI-C `$'...'` inside the body (parse.y
+                    // xparse_dolparen keeps it a quoted region): `\'` is an
+                    // escaped quote, so it must not toggle `inner_single`,
+                    // and a `)` inside is body text. The plain `'`
+                    // toggle below would end the region early at `\'`,
+                    // letting `')` close the span (`$(echo $'a\')b')`).
+                    if !inner_single
+                        && !inner_double
+                        && inner == '$'
+                        && chars.get(cursor + 1).is_some_and(|&(_, next)| next == '\'')
+                    {
+                        cursor += 2;
+                        let mut ansi_escaped = false;
+                        while cursor < chars.len() {
+                            let c = chars[cursor].1;
+                            cursor += 1;
+                            if ansi_escaped {
+                                ansi_escaped = false;
+                            } else if c == '\\' {
+                                ansi_escaped = true;
+                            } else if c == '\'' {
+                                break;
+                            }
+                        }
+                        inner_word.clear();
+                        inner_word_boundary = false;
+                        inner_token_boundary = false;
+                        continue;
+                    }
                     if inner == '\'' && !inner_double {
                         inner_single = !inner_single;
                     }
@@ -1379,6 +1432,30 @@ fn skip_nested_dollar_paren_in_span(chars: &[(usize, char)], start: usize) -> Op
         let (_, ch) = chars[cursor];
         if ch == '\\' && !single {
             cursor += 2;
+            continue;
+        }
+        // ANSI-C `$'...'` inside the nested body: `\'` is an escaped quote,
+        // not the close (parse.y:5476-5480 -> parse_matched_pair
+        // P_ALLOWESC); the plain `'` toggle below would end the region
+        // early at `\'` and a following `)` would close the span.
+        if !single
+            && !double
+            && ch == '$'
+            && chars.get(cursor + 1).is_some_and(|(_, next)| *next == '\'')
+        {
+            cursor += 2;
+            let mut ansi_escaped = false;
+            while cursor < chars.len() {
+                let c = chars[cursor].1;
+                cursor += 1;
+                if ansi_escaped {
+                    ansi_escaped = false;
+                } else if c == '\\' {
+                    ansi_escaped = true;
+                } else if c == '\'' {
+                    break;
+                }
+            }
             continue;
         }
         if ch == '\'' && !double {

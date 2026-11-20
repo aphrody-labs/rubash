@@ -1981,8 +1981,27 @@ impl Executor {
     /// Record that this executor blocked in wait() for a foreground
     /// external process — one of GNU's reap observation points
     /// (wait_for reaps background children while it blocks,
-    /// jobs.c:3064).
+    /// jobs.c:3064) AND one of its coproc disposal points (the
+    /// notify_and_cleanup inside wait_for, jobs.c:3385): both marks
+    /// move.
     pub(in crate::executor) fn note_foreground_wait(&self) {
+        self.foreground_wait_count
+            .set(self.foreground_wait_count.get() + 1);
+        self.disposal_wait_count
+            .set(self.disposal_wait_count.get() + 1);
+    }
+
+    /// Record that a blocking builtin (a `read` whose descriptor is
+    /// a pipe) handed the SIGCHLD handler a synchronous window: the
+    /// reap RECORDS collected in that window publish at the next
+    /// boundary refresh, exactly as after a foreground wait — but
+    /// GNU disposal does NOT follow a builtin (rubash#2053: a
+    /// blocking `read` is not a wait_for, and cleanup_dead_jobs runs
+    /// from wait_for/stop_pipeline/REAP points, never from a
+    /// builtin's return). Only the publication mark moves; the
+    /// disposal mark does not, so the boundary refresh records the
+    /// deaths without retiring any coproc over them.
+    pub(in crate::executor) fn note_blocking_read(&self) {
         self.foreground_wait_count
             .set(self.foreground_wait_count.get() + 1);
     }
@@ -2044,6 +2063,8 @@ impl Executor {
         // reap side.
         let foreground_blocked = mark.2 != self.reap_prev_mark.get().2;
         self.reap_prev_mark.set(mark);
+        let disposal_blocked = self.disposal_wait_count.get() != self.disposal_prev_mark.get();
+        self.disposal_prev_mark.set(self.disposal_wait_count.get());
         let state_observe = force_observe
             || foreground_blocked
             || (crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "monitor")
@@ -2198,14 +2219,23 @@ impl Executor {
                 ));
             }
         }
-        // rubash#2053/#2057: a refresh that observed a foreground
-        // wait is one of GNU's coproc disposal points (the
+        // rubash#2053/#2057: a refresh that observed a wait_for-grade
+        // foreground wait is one of GNU's coproc disposal points (the
         // notify_and_cleanup inside wait_for, jobs.c:3385) — retire
         // the coprocs whose completions have been recorded, including
-        // any recorded by this very refresh. A refresh that observed
-        // nothing (bare boundary) leaves them pending, so the next
-        // command still expands <name>/<name>_PID and {name[i]}.
-        if force_observe || foreground_blocked {
+        // any recorded by this very refresh. The gate is the DISPOSAL
+        // mark, not the publication mark: a blocking builtin `read`
+        // publishes the records from its SIGCHLD window
+        // (foreground_blocked) but is not a disposal point, so a
+        // stretch of builtin reads leaves every recorded coproc
+        // pending — otherwise `read <&${A[0]}; read <&${B[0]}` retired
+        // B at the boundary between the reads whenever B's child had
+        // died during the first read, and the second read met an
+        // unbound array (the named-coproc fd race). A refresh that
+        // observed nothing (bare boundary) likewise leaves them
+        // pending, so the next command still expands
+        // <name>/<name>_PID and {name[i]}.
+        if force_observe || disposal_blocked {
             self.flush_pending_coproc_retirements();
         }
         // GNU parse.y:2533 read_command -> notify_and_cleanup
@@ -2319,6 +2349,36 @@ impl Executor {
     /// Make one reaped child's completion visible in the job table:
     /// the term-signal record, the jobs.c:4625 death notice, the
     /// completion mark, the CHLD trap, coproc retirement.
+    /// rubash#3802: the signal to attribute at a completion from the
+    /// shell's own `kill` delivery record.
+    ///
+    /// The owner of "did this process die by that signal?" is the wait
+    /// status — GNU's `WIFSIGNALED`/`WTERMSIG`, the only arm of
+    /// `printable_job_status (jobs.c:1969-2015)` that prints
+    /// `j_strsignal`. Unix wait statuses carry it (`exit_status_signal`),
+    /// so the record is merely consumed there and can never override a
+    /// `WIFEXITED` status: a trapped/ignored SIGTERM that ends in
+    /// `exit 143` is indistinguishable from a SIGTERM death by code
+    /// alone, and GNU renders `Exit 143`. Windows `ExitStatus` has no
+    /// signal bit — rubash's own `kill` encodes the delivery as
+    /// `TerminateProcess(128+signal)` (builtins/kill.rs
+    /// signal_process) — so the record supplies the signal, but only
+    /// when the reaped code is exactly that signal's `128+signal`.
+    fn delivered_term_signal(&mut self, pid: u32, status: i32) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            let _ = status;
+            self.shell_state.job_table.discard_delivered_signal(pid);
+            None
+        }
+        #[cfg(not(unix))]
+        {
+            self.shell_state
+                .job_table
+                .take_delivered_signal(pid, status)
+        }
+    }
+
     fn apply_job_completion(
         &mut self,
         pid: u32,
@@ -2328,6 +2388,24 @@ impl Executor {
         // The raw wait status knows whether the child died by a
         // signal; the flattened status does not. Record it so the
         // jobs listing prints the signal description (rubash#1256).
+        //
+        // rubash#3802: Windows wait statuses never carry WIFSIGNALED —
+        // this shell's own `kill` encodes the death as
+        // `TerminateProcess (128 + signal)` (builtins/kill.rs
+        // signal_process), so 137/143 alone cannot be told from a
+        // plain `exit 137`. The delivery record fills the gap so
+        // printable_job_status (jobs.c:1969-1985, `j_strsignal
+        // (WTERMSIG (p->status))`) renders `Killed` / `Terminated`;
+        // a job that simply exited keeps `Exit 137`.
+        //
+        // The delivery record only supplies the signal when the reaped
+        // status IS that signal's 128+signal death: GNU's WIFSIGNALED
+        // arm is decided by the wait status, so a process that
+        // ignored/trapped the delivered signal and exited on its own
+        // keeps `Exit <code>` (rubash#3802). The record is consumed
+        // unconditionally so a recycled pid cannot borrow it.
+        let delivered = self.delivered_term_signal(pid, status);
+        let term_signal = term_signal.or(delivered);
         if let Some(signal) = term_signal {
             self.shell_state.job_table.note_term_signal(pid, signal);
         }
@@ -2366,9 +2444,9 @@ impl Executor {
 
     /// Perform deferred coproc retirements (GNU coproc_reap via
     /// cleanup_dead_jobs: vars unbound, endpoints closed). Called at
-    /// disposal points only: a refresh that observed a foreground
-    /// wait (force_observe, or foreground_wait_count moved), and at
-    /// stream end.
+    /// disposal points only: a refresh that observed a wait_for-grade
+    /// foreground wait (force_observe, or disposal_wait_count moved),
+    /// and at stream end.
     fn flush_pending_coproc_retirements(&mut self) {
         if self.pending_coproc_retirements.is_empty() {
             return;
@@ -2698,7 +2776,15 @@ impl Executor {
                 super::read_helpers::note_reaped_child_cpu(&child);
                 // rubash#229: queue the signal-death notice (the job entry
                 // still exists here, so its command text is available).
-                if let Some(signal) = crate::executor::wait_status::exit_status_signal(&done) {
+                // rubash#3803: on Windows `exit_status_signal` is always
+                // None (no WTERMSIG), so fall back to the 128+signal
+                // exit-code decode — the same convention the boundary
+                // reap already uses. Without it the wait's own reap
+                // never queues the notice and the immediate-wait face
+                // (`kill -9 %1; wait %1`) prints nothing.
+                if let Some(signal) = crate::executor::wait_status::exit_status_signal(&done)
+                    .or_else(|| crate::executor::wait_status::exit_code_signal(&done))
+                {
                     let command = self
                         .shell_state
                         .job_table
@@ -5457,7 +5543,7 @@ impl Executor {
                             // (the #1090/#1041 hazard — it was already
                             // erasing this very warning on the will_run
                             // path).
-                            framed_fd_table = Some(self.fd_table.clone());
+                            framed_fd_table = Some(self.fd_table.saved_table());
                             if let Err(error) = self.bind_conditional_stdio_redirects(cmd) {
                                 self.fd_table = framed_fd_table.take().unwrap();
                                 return Err(error);

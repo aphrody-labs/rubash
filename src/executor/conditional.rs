@@ -33,8 +33,6 @@ pub(crate) use extglob::extglob_case_pattern_matches;
 pub(in crate::executor) use extglob::extglob_case_pattern_matches_nocase;
 pub(in crate::executor) use extglob::extglob_case_pattern_matches_nocase_with_word_chars;
 pub(crate) use extglob::extglob_case_pattern_matches_with_word_chars;
-pub(in crate::executor) use extglob::extglob_group_end;
-pub(in crate::executor) use extglob::extglob_split_alternatives;
 pub(in crate::executor) use pattern::{
     case_bracket_expression_matches_with_case, case_pattern_matches, case_pattern_matches_nocase,
     case_pattern_matches_nocase_with_word_chars, case_pattern_matches_with_word_chars,
@@ -1175,10 +1173,10 @@ impl Executor {
 
     pub(super) fn conditional_regex_match(&mut self, left: &str, right: &str) -> bool {
         // Both operands are byte strings in GNU (sh_regmatch regexec's the
-        // expanded text); decode the comsub payload spelling on the subject
+        // expanded text); decode both transport spellings on the subject
         // side too, symmetric with the pattern decode inside
-        // compile_conditional_regex.
-        let left = crate::executor::execution_misc::decode_command_substitution_payload(left);
+        // compile_conditional_regex (rubash#3545).
+        let left = decode_regex_operand(left);
         let right = restore_numeric_decimal_regex_escapes(right);
         let Ok(regex) = self.compile_conditional_regex(&right) else {
             return false;
@@ -1306,7 +1304,7 @@ impl Executor {
         let left_exp = self.expand_conditional_word(left);
         let right_exp = self.expand_conditional_word(right);
         let right_f = restore_numeric_decimal_regex_escapes(&right_exp);
-        let left = crate::executor::execution_misc::decode_command_substitution_payload(&left_exp);
+        let left = decode_regex_operand(&left_exp);
         let right = right_f;
         // GNU xtrace prints arg2 as cond_expand_word returned it —
         // expanded but not yet glob-quoted (execute_cmd.c:4074).
@@ -1345,9 +1343,7 @@ impl Executor {
         if self.regex_operands_nounset_fatal(left, right) {
             return 1;
         }
-        let left = crate::executor::execution_misc::decode_command_substitution_payload(
-            &self.expand_conditional_word(left),
-        );
+        let left = decode_regex_operand(&self.expand_conditional_word(left));
         let right = self.quote_aware_regex_rhs(right, metadata);
         let right = restore_numeric_decimal_regex_escapes(&right);
         self.xtrace_conditional_term("=~", &left, Some(&right));
@@ -1432,7 +1428,12 @@ impl Executor {
         // byte 0x01 (execute_cmd.c:4137 sh_regmatch regcomps the expanded
         // operand). rubash#729 widened the protected byte set, so this
         // decode boundary is what keeps the sentinel out of regcomp.
-        let pattern = crate::executor::execution_misc::decode_command_substitution_payload(pattern);
+        // rubash#3545: the same boundary must also fold the U+E000
+        // raw-byte pairs, or a carrier byte the quoted path already
+        // decoded to a raw byte never matches a pair-encoded subject —
+        // decode_regex_operand covers both spellings, symmetric with
+        // the subject decode at the three match entry points.
+        let pattern = decode_regex_operand(pattern);
         // In a UTF-8 locale the bracket classes expand to Unicode
         // tables (glibc regcomp resolves them through wctype); in byte
         // mode they pass through to the regex crate's ASCII classes,
@@ -1453,6 +1454,13 @@ impl Executor {
         // differently (nested `?`, empty-minimum intervals): rewrite
         // to the nested form before compiling (rubash#1058).
         let pattern = translate_posix_ere_quantifiers(&pattern);
+        // Byte mode (rubash#3791): expand non-ASCII chars to their
+        // `\xHH` byte escapes — see expand_non_ascii_to_byte_escapes.
+        let pattern = if byte_mode {
+            Self::expand_non_ascii_to_byte_escapes(&pattern)
+        } else {
+            pattern
+        };
         // GNU regcomp is called WITHOUT REG_NEWLINE (lib/sh/shmatch.c
         // sh_regmatch), so `.` matches a newline (rubash#1058).
         // Granularity follows the locale model (rubash#1061): glibc
@@ -1474,6 +1482,66 @@ impl Executor {
                 .dot_matches_new_line(true)
                 .build()
                 .map(CompiledConditionalRegex::Text)
+        }
+    }
+
+    /// Byte-mode only (rubash#3791): glibc regcomp in the C locale
+    /// reads the pattern as bytes — a non-ASCII char inside a bracket
+    /// expression is the set of its UTF-8 bytes (`[é]` is {0xC3,
+    /// 0xA9}, `[é-ÿ]` is the byte range 0xA9-0xC3 plus 0xC3/0xBF;
+    /// lib/sh/shmatch.c:79-86 sh_regmatch regcomps with REG_EXTENDED
+    /// and no multibyte decoding). The regex crate in bytes mode
+    /// (unicode(false)) rejects every non-ASCII char inside a class
+    /// with "Unicode not allowed here", so expand each one to its
+    /// `\xHH` byte escapes before compiling: ranges then resolve on
+    /// bytes exactly as glibc resolves them, and a literal non-ASCII
+    /// char outside brackets keeps the byte-sequence meaning it
+    /// already had. A backslash before a non-ASCII char is dropped —
+    /// glibc reads `\` + byte as the literal byte, while the crate
+    /// rejects `\é` as an unrecognized escape. Runs after the bracket
+    /// translation (which doubles bare backslashes inside brackets,
+    /// so a `\` + non-ASCII pair can only be an outside-bracket
+    /// escape here) and after the quantifier rewrite (which copies
+    /// bracket spans verbatim). Raw-byte marker pairs (U+E000…)
+    /// expand the same way; pattern and subject stay in the same
+    /// marker encoding, so their consistency is preserved.
+    fn expand_non_ascii_to_byte_escapes(pattern: &str) -> String {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut out = String::with_capacity(pattern.len());
+        let mut index = 0usize;
+        while index < chars.len() {
+            let c = chars[index];
+            if c == '\\' && index + 1 < chars.len() {
+                let next = chars[index + 1];
+                if next == '\\' {
+                    out.push('\\');
+                    out.push('\\');
+                    index += 2;
+                    continue;
+                }
+                if !next.is_ascii() {
+                    Self::push_char_as_byte_escapes(&mut out, next);
+                    index += 2;
+                    continue;
+                }
+                out.push('\\');
+                index += 1;
+                continue;
+            }
+            if c.is_ascii() {
+                out.push(c);
+            } else {
+                Self::push_char_as_byte_escapes(&mut out, c);
+            }
+            index += 1;
+        }
+        out
+    }
+
+    fn push_char_as_byte_escapes(out: &mut String, c: char) {
+        let mut buf = [0u8; 4];
+        for byte in c.encode_utf8(&mut buf).as_bytes() {
+            out.push_str(&format!("\\x{byte:02X}"));
         }
     }
 
@@ -1696,14 +1764,16 @@ impl Executor {
         self.xtrace_conditional_term(op, &left_expanded, Some(&right_expanded));
         // GNU test.c:357 arithcomp -> evalexp: expr.c:1190-1216
         // expr_streval raises err_unboundvar for a bare unset name when
-        // unbound_vars_is_error. The raw evaluator below reads unset
-        // names as 0, so the nounset prologue the (( ))/let paths run
-        // has to run here too, per operand, in evaluation order
-        // (rubash#1709 — the #1130/#1201 family covered the $-expansion
-        // path; a bare name never expands, it reaches evalexp as text).
-        if let Some(status) = self.conditional_nounset_arith_trap(&left_expanded) {
-            return status;
-        }
+        // unbound_vars_is_error — but only for a name evalexp actually
+        // READS (expr.c:1164-1167: `0 && u` short-circuits under noeval
+        // and never reads `u`). The evaluator traps at its own read
+        // points (rubash#3496), so no text scan may judge the operand
+        // first: the pre-#3563 nounset prologue that scanned the
+        // expanded text trapped exactly those never-read names
+        // (rubash#3563 row 1). A failed evaluation whose category is
+        // UnboundVariable takes the fatal nounset path below, with the
+        // evaluator's own name; every other failure keeps the
+        // arithmetic-error report.
 
         // GNU execute_cmd.c:4049-4068 -> test.c:357-372 arithcomp -> evalexp:
         // the operands were word-expanded by cond_expand_word (mode 3,
@@ -1715,19 +1785,40 @@ impl Executor {
         // (expr.c:1502-1510), hence no_expand inside the parser.
         let left_eval = self.expand_arith_indexed_subscripts(&left_expanded);
         let left_dynamic = self.arith_dynamic_context();
-        let (Some(left_val), _) = eval_mutable_arith_value_with_random_flags(
-            &left_eval,
-            &mut self.shell_state.env_vars,
-            Some(&self.shell_state.random_state),
-            Some(&left_dynamic),
-            true,
-            Some(&self.shell_state.variables),
-        ) else {
-            self.flush_arith_diags(Some("[["));
+        // GNU execute_cmd.c:4164 execute_cond_command sets
+        // this_command_name = "[[" for the whole conditional; the
+        // arithcomp evalexp diagnostics carry that label
+        // (rubash#3295).
+        let (left_val, left_category) = {
+            let _arith_label =
+                crate::executor::arithmetic::arith_eval_label_scope(Some("[[".to_string()));
+            eval_mutable_arith_value_with_random_flags(
+                &left_eval,
+                &mut self.shell_state.env_vars,
+                Some(&self.shell_state.random_state),
+                Some(&left_dynamic),
+                true,
+                // GNU cond_expand_word (execute_cmd.c:4024) word-expands
+                // the operand before arithcomp's evalexp, so an empty
+                // subscript expansion is the empty-bracket token
+                // (rubash#3252).
+                true,
+                Some(&self.shell_state.variables),
+            )
+        };
+        let Some(left_val) = left_val else {
+            if left_category
+                == Some(crate::executor::arithmetic::ArithmeticErrorCategory::UnboundVariable)
+            {
+                if let Some(status) = self.conditional_nounset_eval_trap() {
+                    return status;
+                }
+            }
+            self.flush_arith_diags();
             self.report_conditional_arithmetic_error(&left_eval);
             return 1;
         };
-        self.flush_arith_diags(Some("[["));
+        self.flush_arith_diags();
         // rubash#404: GNU test.c:357-372 arithcomp -> evalexp binds the
         // operand's assignment side effects into the one variable store, so
         // the next parameter expansion sees them (`n=1; x='n+=2';
@@ -1735,41 +1826,58 @@ impl Executor {
         // only; sync the typed variables map at this boundary like the
         // `(( ))` / `let` / subscript evaluators do.
         super::arithmetic::sync_arith_writes(self);
-        if let Some(status) = self.conditional_nounset_arith_trap(&right_expanded) {
-            return status;
-        }
         let right_eval = self.expand_arith_indexed_subscripts(&right_expanded);
         let right_dynamic = self.arith_dynamic_context();
-        let (Some(right_val), _) = eval_mutable_arith_value_with_random_flags(
-            &right_eval,
-            &mut self.shell_state.env_vars,
-            Some(&self.shell_state.random_state),
-            Some(&right_dynamic),
-            true,
-            Some(&self.shell_state.variables),
-        ) else {
-            self.flush_arith_diags(Some("[["));
+        let (right_val, right_category) = {
+            let _arith_label =
+                crate::executor::arithmetic::arith_eval_label_scope(Some("[[".to_string()));
+            eval_mutable_arith_value_with_random_flags(
+                &right_eval,
+                &mut self.shell_state.env_vars,
+                Some(&self.shell_state.random_state),
+                Some(&right_dynamic),
+                true,
+                // Same expand-entry law as the left operand above
+                // (rubash#3252).
+                true,
+                Some(&self.shell_state.variables),
+            )
+        };
+        let Some(right_val) = right_val else {
+            if right_category
+                == Some(crate::executor::arithmetic::ArithmeticErrorCategory::UnboundVariable)
+            {
+                if let Some(status) = self.conditional_nounset_eval_trap() {
+                    return status;
+                }
+            }
+            self.flush_arith_diags();
             self.report_conditional_arithmetic_error(&right_eval);
             return 1;
         };
-        self.flush_arith_diags(Some("[["));
+        self.flush_arith_diags();
         super::arithmetic::sync_arith_writes(self);
         i32::from(!conditional_numeric_matches(left_val, op, right_val))
     }
 
     /// The `set -u` side of GNU's arithcomp evaluation (expr.c:1190-1216
-    /// expr_streval -> err_unboundvar): scan one already-expanded
-    /// numeric operand for a bare unset name. On a trap, mirror
+    /// expr_streval -> err_unboundvar), judged by the evaluator itself:
+    /// a failed operand evaluation whose category is UnboundVariable
+    /// carries the name expr_streval trapped — the name actually read,
+    /// after noeval short-circuits and assignment-target exclusions
+    /// (rubash#3563 row 1: the text scan this replaces trapped `u` in
+    /// `0 && u`, a name evalexp never reads). On a trap, mirror
     /// expand_conditional_word's FATAL branch — print the diagnostic
     /// through the conditional's fd 2 and park the fatal status for
     /// execute_conditional_command_with_redirects to unwind with the
     /// FORCE_EOF / interactive-DISCARD classes (rubash#1709).
-    fn conditional_nounset_arith_trap(&mut self, operand: &str) -> Option<i32> {
+    /// Returns None when the evaluator recorded no name, so the caller
+    /// falls through to its arithmetic-error report.
+    fn conditional_nounset_eval_trap(&mut self) -> Option<i32> {
         if !crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "nounset") {
             return None;
         }
-        let name =
-            super::arithmetic::arithmetic_unbound_variable(operand, &self.shell_state.env_vars)?;
+        let name = super::arithmetic::take_arith_unbound_name()?;
         let line = format!(
             "{}{}: {}\n",
             self.diagnostic_prefix(),
@@ -2151,6 +2259,31 @@ impl CompiledConditionalRegex {
 /// (rubash#1061) and is gone with it.
 fn conditional_regex_byte_mode() -> bool {
     !crate::locale::is_utf8()
+}
+
+/// Regex-boundary decode (rubash#3545): GNU sh_regmatch receives the
+/// expanded operands as raw bytes (execute_cmd.c:4096, via
+/// execute_cmd.c:4068 cond_expand_word mode 2 and subst.c:4114
+/// QGLOB_REGEXP). Rubash transport pair-encodes carrier bytes (0x0c,
+/// 0x11, 0x13, 0x14..=0x1f) as U+E000 raw-byte pairs, and
+/// decode_command_substitution_payload only restores the U+E319 comsub
+/// sentinel — so a pattern the quoted path had already decoded to raw
+/// bytes (regex_rhs_marked_chars via shell_text_to_raw_bytes) never
+/// matched a pair-encoded subject, while the unquoted path only
+/// matched by accident of both sides staying encoded. Decode both
+/// spellings — sentinel first (it can only yield U+0000..=U+00FF, so
+/// it can never mint a pair introducer), then the raw-byte pairs —
+/// so pattern and subject meet as the same raw bytes, the same
+/// normalization the #729 glob side already applies. Non-UTF-8 bytes
+/// ride as byte-chars (U+0000..=U+00FF), which keep pattern and
+/// subject in the same spelling in both regex modes.
+fn decode_regex_operand(value: &str) -> String {
+    let decoded = crate::executor::execution_misc::decode_command_substitution_payload(value);
+    if crate::executor::markers::contains_decodable_transport(&decoded) {
+        crate::executor::substitution_metadata::decode_raw_byte_markers_to_byte_chars(&decoded)
+    } else {
+        decoded
+    }
 }
 
 /// Convert one byte-mode capture into rubash's storage spelling: valid

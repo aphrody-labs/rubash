@@ -160,6 +160,19 @@ pub struct JobTable {
     /// of these must not publish its death notice before a `wait`
     /// has had its chance to reap the job itself.
     pub fresh_fatal_marks: Vec<(u32, u64)>,
+    /// Terminating signals this shell's own `kill` delivered to a
+    /// background pid (rubash#3802), awaiting the completion that
+    /// records the job's death. Windows `ExitStatus` carries no
+    /// WIFSIGNALED bit — `signal_process` encodes a kill as
+    /// `TerminateProcess (128 + signal)` — so the reap alone cannot
+    /// tell a SIGKILL death (exit code 137) from a plain `exit 137`.
+    /// GNU keeps WTERMSIG in the wait status and printable_job_status
+    /// (jobs.c:1969-1985) prints `j_strsignal`, i.e. `Killed`; the
+    /// delivery record supplies that signal. Consumed by
+    /// [`Self::take_delivered_signal`] at completion, and dropped
+    /// when a pid is re-registered, so a recycled pid cannot borrow
+    /// an old delivery.
+    pub delivered_signals: Vec<(u32, i32)>,
 }
 
 impl JobTable {
@@ -248,6 +261,10 @@ impl JobTable {
                 )
             })
             .collect();
+        // rubash#3802: a delivery record belongs to the process that
+        // occupied this pid; a re-registered pid starts clean.
+        self.delivered_signals
+            .retain(|(marked, _)| !pids.contains(marked));
         let command = command.into();
         // get_job_by_name needs one entry per pipeline stage (GNU's
         // j->pipe PROCESS list); a caller that cannot describe them keeps
@@ -312,12 +329,25 @@ impl JobTable {
         // common.c:720-738: the switch is on the FIRST byte, so `%+x`
         // is the current job and `%-x` the previous one.
         match body.chars().next() {
+            // common.c:724-727: `%`, `%%`, `%+` (and the empty body of
+            // a bare `%`) return js.j_current VERBATIM — GNU has no
+            // newest-job fallback. The caller-side INVALID_JOB
+            // (jobs.h:115) then rejects NO_JOB and any slot whose job
+            // is already gone, so `wait %%` after the job table drains
+            // reports "no such job" even while dead-but-unreaped
+            // entries still occupy the table (rubash#3638). The
+            // contains_key check is that slot validation folded into
+            // the resolver: a marker can only ever name a live entry
+            // or None, and a stale id must not resolve.
             None | Some('%') | Some('+') => self
                 .current_job
-                .or_else(|| self.jobs.keys().next_back().copied())
+                .filter(|id| self.jobs.contains_key(id))
                 .map_or(JobspecMatch::NoMatch, JobspecMatch::Job),
+            // common.c:729-730: `%-` returns js.j_previous through the
+            // same INVALID_JOB gate.
             Some('-') => self
                 .previous_job
+                .filter(|id| self.jobs.contains_key(id))
                 .map_or(JobspecMatch::NoMatch, JobspecMatch::Job),
             Some('?') => self.get_job_by_name(&body[1..], true),
             Some(_) => self.get_job_by_name(body, false),
@@ -577,6 +607,48 @@ impl JobTable {
         } else {
             false
         }
+    }
+
+    /// Remember the terminating signal the shell's own `kill` handed
+    /// to `pid`, so the completion that reaps it can name the death
+    /// the way GNU's wait status does (rubash#3802). A newer signal
+    /// to the same pid supersedes the older one.
+    pub fn note_delivered_signal(&mut self, pid: u32, signal: i32) {
+        self.delivered_signals.retain(|(marked, _)| *marked != pid);
+        self.delivered_signals.push((pid, signal));
+    }
+
+    /// Consume the delivery record for `pid` at its completion and
+    /// return the signal ONLY when the reaped `status` is that
+    /// signal's `128+signal` death (rubash#3802). GNU decides the
+    /// jobs wording from the wait status itself: `printable_job_status`
+    /// (jobs.c:1969-2015) calls `j_strsignal(WTERMSIG(p->status))`
+    /// only in the `WIFSIGNALED` arm and renders `Exit %d` from
+    /// `WEXITSTATUS` otherwise — so a process that survived the
+    /// signal we delivered (ignored it, trapped it, or was already
+    /// past it) keeps its real exit status. A mismatch therefore
+    /// means the delivery did not end the process; the record is
+    /// consumed either way so a recycled pid cannot borrow it.
+    ///
+    /// Only a platform whose wait status has NO `WIFSIGNALED` trace
+    /// may call this: a normal `exit 143` is indistinguishable from
+    /// a SIGTERM death by the code alone, so where the kernel status
+    /// exists ([`Self::discard_delivered_signal`]) it is authoritative.
+    pub fn take_delivered_signal(&mut self, pid: u32, status: i32) -> Option<i32> {
+        let position = self
+            .delivered_signals
+            .iter()
+            .position(|(marked, _)| *marked == pid)?;
+        let (_, signal) = self.delivered_signals.remove(position);
+        (status == 128 + signal).then_some(signal)
+    }
+
+    /// Drop the delivery record for `pid` at its completion without
+    /// applying it (rubash#3802). Used where the kernel wait status is
+    /// authoritative (`WIFSIGNALED`/`WTERMSIG` present): the record
+    /// must not override it, and must not outlive the completion.
+    pub fn discard_delivered_signal(&mut self, pid: u32) {
+        self.delivered_signals.retain(|(marked, _)| *marked != pid);
     }
 
     /// Publish deferred marks at an observation event
@@ -1117,6 +1189,38 @@ mod tests {
         assert_eq!(table.resolve_jobspec("%1"), JobspecMatch::Job(first));
         assert!(table.remove_job(first));
         assert!(table.jobs.is_empty());
+    }
+
+    #[test]
+    fn drained_current_marker_jobspecs_report_no_match() {
+        // rubash#3638: common.c:727 returns js.j_current VERBATIM for
+        // `%%`/`%+`/`%` — there is no newest-job fallback — and the
+        // caller-side INVALID_JOB (jobs.h:115) rejects NO_JOB. After
+        // reset_current clears both markers (every remaining entry is
+        // dead) the spec resolves to nothing even while a
+        // dead-but-notified entry still occupies the table, so `wait
+        // %%` after the table drains reports "no such job".
+        let mut table = JobTable::default();
+        table.register_process(1, "one", true, 1);
+        table.register_process(2, "two", true, 2);
+        table.mark_completed(1, 0);
+        table.mark_job_waited_by_pid(1);
+        table.mark_completed(2, 0);
+        // The `wait %2` cleanup pass: job1 (the previous marker)
+        // leaves and reset_current finds no stopped/running candidate,
+        // clearing current and previous while job2's corpse remains.
+        table.cleanup_dead_jobs();
+        assert_eq!(table.current_job(), None);
+        assert_eq!(table.previous_job(), None);
+        assert!(table.jobs.contains_key(&2));
+        table.mark_job_waited_by_pid(2);
+        assert_eq!(table.resolve_jobspec("%%"), JobspecMatch::NoMatch);
+        assert_eq!(table.resolve_jobspec("%+"), JobspecMatch::NoMatch);
+        assert_eq!(table.resolve_jobspec("%"), JobspecMatch::NoMatch);
+        assert_eq!(table.resolve_jobspec("%-"), JobspecMatch::NoMatch);
+        // The corpse still answers its numeric spec: GNU keeps the
+        // slot until the next cleanup_dead_jobs (jobs.c:1303).
+        assert_eq!(table.resolve_jobspec("%2"), JobspecMatch::Job(2));
     }
 
     #[test]

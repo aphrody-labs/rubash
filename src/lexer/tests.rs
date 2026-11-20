@@ -746,11 +746,23 @@ fn nested_keyword_function_body_counts_as_group_opener() {
 }
 
 /// rubash#465 end-to-end shape (mirkop.sh): a completed `&& { ... <<< ""; }`
-/// group (whose herestring operator blocks its own fold) followed by a
-/// keyword-form function whose body holds a nested keyword-form function.
-/// The later definition's fold must keep both `}` lines: the outer body
-/// token spans to the LAST `}`, leaving no stray top-level closer, and the
-/// trailing statement survives.
+/// group followed by a keyword-form function whose body holds a nested
+/// keyword-form function. The token stream must stay balanced: every
+/// group is either folded into one self-contained token or emitted as a
+/// bare opener whose `}` arrives as its own token, no stray closer may
+/// trail, and the nested definition's content survives.
+///
+/// This used to assert that h's body specifically FOLDS into one token.
+/// That shape was incidental: it held only while the `<<<` group in f's
+/// body was refused its fold by the rubash#3967 phantom (the brace-group
+/// heredoc scan mistook the second `<` of `<<<` for the `<<` operator).
+/// With the phantom gone the `<<<` group folds like any heredoc-free
+/// group — the same landscape a plain `true` body produces on master —
+/// and h's body is then emitted in the paired bare-opener form instead.
+/// Both landscapes are balanced; the #465 breakage (a stray top-level
+/// closer swallowing the definitions in between) is the imbalance
+/// asserted against here. When h's body does fold, its span must still
+/// satisfy the original reach-the-outer-`}` property.
 #[test]
 fn herestring_group_then_nested_function_definitions_fold_balanced() {
     let script = concat!(
@@ -768,32 +780,45 @@ fn herestring_group_then_nested_function_definitions_fold_balanced() {
         "}\n",
     );
     let tokens = tokenize(script);
-    // No group token may be left unclosed, and no standalone `}' closer may
-    // trail the folded h body: the fold must reach the outer `}`.
-    let folded = tokens
-        .iter()
-        .filter(|token| {
-            token.kind == TokenKind::Keyword
-                && token.value.starts_with('{')
-                && token.value.contains('\n')
-        })
-        .count();
-    assert!(folded >= 1, "h's multi-line body should fold: {tokens:?}");
-    let h_body = tokens
-        .iter()
-        .find(|token| {
-            token.kind == TokenKind::Keyword
-                && token.value.starts_with('{')
-                && token.value.contains("function i")
-        })
-        .expect("folded h body token");
+    // Balance: bare `{`/`}` Keyword tokens pair up exactly and the
+    // stream does not end inside a group (folded group tokens are
+    // self-balanced by construction).
+    let mut depth = 0usize;
+    for token in &tokens {
+        if token.kind == TokenKind::Keyword {
+            if token.value == "{" {
+                depth += 1;
+            } else if token.value == "}" {
+                depth = depth
+                    .checked_sub(1)
+                    .expect("stray `}` closer in token stream");
+            }
+        }
+    }
+    assert_eq!(depth, 0, "token stream must end balanced: {tokens:?}");
+    // The nested definition's content survives tokenization — as its
+    // own Word token in the paired landscape, or inside the folded
+    // body token's text in the folded landscape.
     assert!(
-        h_body.value.matches('}').count() >= 2
-            && h_body.value.trim_end().ends_with('}')
-            && h_body.value.contains("printf X"),
-        "h body fold must include the nested function and both closers, got {:?}",
-        h_body.value
+        tokens.iter().any(|token| token.value.contains("printf")),
+        "nested definition content must survive: {tokens:?}"
     );
+    // When h's body folds into one token, the fold must reach the
+    // outer `}` and include the nested function (the original #465
+    // span property).
+    if let Some(h_body) = tokens.iter().find(|token| {
+        token.kind == TokenKind::Keyword
+            && token.value.starts_with('{')
+            && token.value.contains("function i")
+    }) {
+        assert!(
+            h_body.value.matches('}').count() >= 2
+                && h_body.value.trim_end().ends_with('}')
+                && h_body.value.contains("printf X"),
+            "h body fold must include the nested function and both closers, got {:?}",
+            h_body.value
+        );
+    }
 }
 
 #[test]
@@ -1316,6 +1341,39 @@ fn extglob_pattern_words_stay_single_words() {
     }
     crate::lexer::set_parse_extended_glob(false);
 }
+
+#[test]
+fn issue3813_alias_after_comsub_comment_quote_expands() {
+    // rubash#3813: a `#` comment carrying an odd number of apostrophes
+    // inside `$(...)` must not hide the aliases after the substitution.
+    // The pre-pass's `$(` scanner used to treat the apostrophe as a real
+    // quote opener, swallowing the rest of the input as one word, so the
+    // closing alias `E='}; }'` never expanded and the alias-introduced
+    // `{` stayed unclosed (GNU: parse.y:3631 shell_getc — `#` at a
+    // token start always comments to EOL).
+    let lookup = |name: &str| match name {
+        "T" => Some(("{ f() {".to_string(), false)),
+        "E" => Some(("}; }".to_string(), false)),
+        _ => None,
+    };
+    let input = "T\n  v=$(echo hi # don't\n)\n  echo \"v=[$v]\"\nE\nf\necho done\n";
+    let out = expand_aliases_in_source(input, &lookup, false);
+    assert!(
+        out.starts_with("{ f() {"),
+        "opening alias T did not expand:\n{out}"
+    );
+    assert!(
+        out.contains("}; }"),
+        "closing alias E did not expand; expansion was:\n{out}"
+    );
+    // Even counts closed the phantom quote again, so they passed even
+    // before the fix — pin them too, so the parity cannot flip back.
+    let even = "T\n  v=$(echo hi # don't can't\n)\n  echo \"v=[$v]\"\nE\nf\necho done\n";
+    assert!(
+        expand_aliases_in_source(even, &lookup, false).contains("}; }"),
+        "even-count control regressed"
+    );
+}
 #[test]
 fn dparen_arith_group_open_at_end_matches_gnu_reader() {
     // rubash#435: the feeder join gate's walker. GNU parse.y:4904
@@ -1473,4 +1531,22 @@ fn issue1544_locked_body_relex_ignores_in_body_posix_switch() {
         TokenKind::Word,
         "posix pass + dash word = plain word (frozen veto): {tokens:?}"
     );
+}
+
+#[test]
+fn skip_extglob_group_chars_matched_pair_units() {
+    for input in [
+        "@(ax|$(echo `echo \"q`)ay)",
+        "@(ax|`echo \")\"`ay)",
+        "@(ax|${var:-)}ay)",
+        "@(ax|$[1+2]ay)",
+        "@(\"$(echo `echo \"q`)\"|x)",
+    ] {
+        let chars: Vec<char> = input.chars().collect();
+        assert_eq!(
+            super::skip::skip_extglob_group_chars(&chars, 1),
+            Some(chars.len()),
+            "input: {input}"
+        );
+    }
 }

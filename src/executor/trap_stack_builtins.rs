@@ -29,13 +29,33 @@ fn decode_raw_byte_marker_bytes(bytes: &[u8]) -> Vec<u8> {
 /// so the log preserves the production order across both fds.
 pub(in crate::executor) struct OrderedOutputLog {
     chunks: std::rc::Rc<std::cell::RefCell<Vec<(u8, Vec<u8>)>>>,
+    // rubash#3921 (D1): printf's fd-1 chunks are FINAL bytes — its Text
+    // segments already passed through `escape::raw_bytes`
+    // (shell_text_to_raw_bytes) inside the builtin — so the direct flush
+    // must NOT run the marker decode over them again (a literal U+E000
+    // + payload pair would fold to a NUL byte on the second decode).
+    // Every other log writer stores transport text and leaves this
+    // false, so their chunks still decode exactly once. Stderr chunks
+    // are transport text even for printf (diagnostics are written
+    // verbatim) and always decode.
+    stdout_final_bytes: bool,
 }
 
 impl OrderedOutputLog {
     pub(in crate::executor) fn new() -> Self {
         OrderedOutputLog {
             chunks: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            stdout_final_bytes: false,
         }
+    }
+
+    /// Mark this log's fd-1 chunks as final bytes (printf only).
+    pub(in crate::executor) fn mark_stdout_final_bytes(&mut self) {
+        self.stdout_final_bytes = true;
+    }
+
+    pub(in crate::executor) fn stdout_is_final_bytes(&self) -> bool {
+        self.stdout_final_bytes
     }
 
     pub(in crate::executor) fn stdout_writer(&self) -> OrderedChunkWriter {
@@ -150,7 +170,10 @@ impl Executor {
         // reject gate's Input probe and the setup walk), so this
         // pass owns exactly the registry classes those passes skip:
         // net targets (probed through the classified ladder — the
-        // probe's netopen is the command's one open), fd aliases
+        // probe's netopen is the command's one open when no bind ran;
+        // when the funnel's bind already connected the entry,
+        // buffered_builtin_input_redirect_error skips it, rubash#3798),
+        // fd aliases
         // (judged against the fd table, no drain), and synthetic
         // /proc targets (served by their ladder). A failure routes
         // its diagnostic through the command's fd-2 binding, drops
@@ -227,7 +250,17 @@ impl Executor {
         let decoded: Vec<(u8, Vec<u8>)> = log
             .chunks()
             .iter()
-            .map(|(fd, bytes)| (*fd, decode_raw_byte_marker_bytes(bytes)))
+            .map(|(fd, bytes)| {
+                // rubash#3921 (D1): a log whose fd-1 chunks are already
+                // final bytes (printf's Text segments) skips the decode
+                // on fd 1 only — stderr chunks are transport text and
+                // still decode exactly once.
+                if *fd == 1 && log.stdout_is_final_bytes() {
+                    (*fd, bytes.clone())
+                } else {
+                    (*fd, decode_raw_byte_marker_bytes(bytes))
+                }
+            })
             .collect();
         if self.route_builtin_buffered_output_chunks(cmd, &decoded, false)? {
             return Ok(());
@@ -278,6 +311,28 @@ impl Executor {
                 continue;
             }
             let write = redirect.kind == RedirectKind::ReadWrite;
+            // rubash#3798: a net `<>` entry the funnel's bind already
+            // connected (its fd is in dispatch_net_bound_fds) must not
+            // be re-probed here — the bind performed this entry's one
+            // open (GNU redir.c do_redirections opens each entry
+            // once, r_input_output included), and the probe's
+            // classified open would connect a SECOND socket and drop
+            // it (the #1950 hazard the input probe already avoids).
+            // A refused connect was already adjudicated by the bind,
+            // so skipping loses no failure verdict. The skip is
+            // net-only: synthetic /proc and link entries have no
+            // bind, so their probe still runs.
+            if write
+                && matches!(
+                    crate::special_paths::classify_special_path(&target),
+                    crate::special_paths::SpecialPathClass::NetRedirect
+                )
+                && self
+                    .dispatch_net_bound_fds
+                    .contains(&redirect.fd.unwrap_or(0))
+            {
+                continue;
+            }
             let result = match crate::special_paths::classify_special_path(&target) {
                 crate::special_paths::SpecialPathClass::NetRedirect
                 | crate::special_paths::SpecialPathClass::SyntheticProc

@@ -88,7 +88,6 @@ issue2578_comp_wordbreaks_regressions PRODUCT: #2578 CLOSED; 1 test fails; compl
 issue2599_procsub_producer_varfd_regressions PRODUCT: #2599 CLOSED; 3 tests fail; procsub producer varfd; fix 1814bb67 landed; stale pin vs regression
 issue2622_fg_bg_group_sigcont_regressions TIMING: #2622 CLOSED; 2 tests fail; PTY fg/bg timed out waiting for stopped-notice line; last touch pin fix b20d2d18; serial re-run (parallel-load timing)
 issue2624_kill_jobspec_group_delivery_regressions TIMING: #2624 CLOSED; 4 tests fail; PTY kill/jobspec timed out waiting for stopped-notice line; last touch fmt 6c31956b; serial re-run (parallel-load timing)
-issue2634_extdebug_bash_argc_sticky PINS-FIRST: #2634 OPEN; 6 tests fail; fix PR #3427 in review, unmerged
 issue2662_read_high_byte_delimiter PRODUCT: #2662 CLOSED; 1 test fails; read -d high-byte delimiter rc; fix 947bbc9f (#3142) landed; stale pin vs regression
 issue2697_subshell_member_death_notice_regressions PINS-FIRST: #2697 OPEN; 2 tests fail; J1 pins-first, jobs-side adjudication owed
 issue2739_continuation_error_attribution_regressions MISMATCH: #2739 CLOSED; 1 test fails; attribution family, F4 fix 30b1b51c landed but cell still fails; fix-vs-pin mismatch, adjudication owed
@@ -111,6 +110,7 @@ issue3060_for_loop_locale_warning PRODUCT: #3060 CLOSED; 1 test fails; for-loop 
 issue3209_function_body_first_redirect_stamp PRODUCT: #3209 CLOSED; 1 test fails; function-body first redirect stamp; last touch d7a37258 (#3266); product divergence
 issue327_empty_brace_body_regressions PRODUCT: #327 CLOSED; 4 tests fail; empty brace body; fix 87385688 landed; stale pin vs regression
 issue3284_engine_wait_termsig_regressions TIMING: #3284 CLOSED; 1 test fails; 'must die by signal: Some(0)' (child exited 0 before signal, timing race); fix 82244adb (#3367) landed; #3401 covers #3284 residuals; serial re-run
+issue3311_exec_child_fd_delivery ENV: #3312 OPEN / #3313 CLOSED (fix f2ada2b8 landed); 4 of 10 tests fail in CI only; the census runner image (ubuntu-26.04, 20261111.196) ships uutils coreutils 0.8.0 as /bin/cat and /bin/echo -- uucore reopens /dev/null for a closed std fd at startup and phrases write errors in its own form, so the GNU diagnostic text the #3312/#3313 tests assert cannot be witnessed on that image; product behavior verified by strace (close(0) delivered before execve; the fixed build is byte-identical to the GNU bash 5.3.20 oracle in both environments) and 10/10 on a GNU coreutils 9.4 host; delete this line when the census runner image ships GNU coreutils again
 issue332_extglob_gate_paren_regressions PRODUCT: #332 CLOSED; 10 tests fail; extglob gate paren; fix 402d1d53 landed; stale pin vs regression
 issue353_ansi_u_readtime_locale_regressions PRODUCT: #353 CLOSED; 4 tests fail; ANSI-U readtime locale bytes; last touch fix d5d66428 (#355 followup); product divergence
 issue358_set_bundled_flags_regressions PRODUCT: #358 CLOSED; 1 test fails; set bundled flags; last touch test fix 225eb9e9 (#766); product divergence

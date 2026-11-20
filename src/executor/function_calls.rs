@@ -689,17 +689,14 @@ impl Executor {
                 // push when debugging — the first materialization
                 // installs the bottom frame from the CURRENT positional
                 // parameters (the caller's context), which then persists
-                // for the shell's lifetime (rubash#1051).
-                if self.shell_state.bash_arg_bottom.borrow().is_none() {
-                    *self.shell_state.bash_arg_bottom.borrow_mut() = Some(
-                        self.shell_state
-                            .positional_window()
-                            .iter()
-                            .rev()
-                            .cloned()
-                            .collect(),
-                    );
-                }
+                // for the shell's lifetime (rubash#1051). rubash#3909:
+                // call the shared init, not an inline latch — it is a
+                // no-op once bash_argv_initialized is set (startup
+                // arming with no args must not install a frame here;
+                // oracle: `-O extdebug -c 'shopt -u extdebug; shopt -s
+                // extdebug; f(){ declare -p BASH_ARGC; }; f a'` ->
+                // ([0]="1") with no bottom frame).
+                self.init_bash_argv();
                 self.shell_state
                     .bash_argc_stack
                     .insert(0, args.len().to_string());
@@ -708,6 +705,7 @@ impl Executor {
                 }
             } else if crate::builtins::shopt::compatibility_level(&self.shell_state.env_vars) <= 44
                 && self.shell_state.bash_arg_bottom.borrow().is_none()
+                && !self.shell_state.bash_argv_initialized.get()
             {
                 // rubash#1110 item 4 / rubash#1051 integration: GNU
                 // execute_cmd.c:5337-5339 runs init_bash_argv at
@@ -725,6 +723,12 @@ impl Executor {
                 // earlier (startup, extdebug enable, or a top-level
                 // read via variables.c get_bashargcv). Once installed,
                 // the frame persists for later reads at any level.
+                // rubash#3909: unless bash_argv_initialized is
+                // already set (startup arming): GNU's entry-time init
+                // is then a no-op and no empty frame appears (oracle:
+                // `-O extdebug -c 'shopt -u extdebug; shopt -s
+                // compat44; f(){ declare -p BASH_ARGC; }; f a'` ->
+                // ()), hence the flag guard on this branch.
                 *self.shell_state.bash_arg_bottom.borrow_mut() = Some(Vec::new());
             }
             self.set_positional_params(args.to_vec());
@@ -1380,7 +1384,7 @@ impl Executor {
         // end.
         let mut last_stdout_leg: Option<Redirect> = None;
         let mut last_stderr_leg: Option<Redirect> = None;
-        for redirect in &call_cmd.redirects {
+        for (call_position, redirect) in call_cmd.redirects.iter().enumerate() {
             if redirect.fd_var.is_some() {
                 continue;
             }
@@ -1414,8 +1418,32 @@ impl Executor {
                 // entries are not pre-created either (a truncating
                 // create would eat the file's prior content — the
                 // body's own append open creates it instead).
+                // rubash#3372: the node form — the pre-create is a
+                // truncating open, so a genuine leg must not read a
+                // transport sibling's string record (e.g. an earlier
+                // `>>"$a"` expansion would make `2>"$b"` truncate
+                // the raw-byte file instead of creating the UTF-8 one).
                 if !redirect.append && redirect_target_fd(&target).is_none() {
-                    self.create_redirect_output_prepared(&target, redirect.clobber)?;
+                    // rubash#3875: an earlier walk of this call (a
+                    // pipeline stage gate, the reject gate) may
+                    // already have performed this entry's one open
+                    // and parked it - the pre-create is then a second
+                    // open of a file the umask may have created
+                    // without owner-write, which fails EACCES. Adopt
+                    // the parked handle and skip the create; the
+                    // scope wrap's own walk adopts it for the bind.
+                    if !self
+                        .pending_preopened_redirects
+                        .borrow()
+                        .get(&call_position)
+                        .is_some_and(|(recorded, _, _)| recorded == &target)
+                    {
+                        self.create_redirect_output_prepared_for(
+                            Some(redirect),
+                            &target,
+                            redirect.clobber,
+                        )?;
+                    }
                 }
                 let mut append_redirect = redirect.clone();
                 append_redirect.target = target;
@@ -1482,11 +1510,24 @@ impl Executor {
                 last_stderr_leg = Some(append_redirect);
             } else {
                 let target = self.expand_redirect_target(redirect);
+                // rubash#3372: the node form (see the fd-1 leg above).
                 if !redirect.append
                     && redirect_target_fd(&target).is_none()
                     && !is_null_device(&target)
                 {
-                    self.create_redirect_output_prepared(&target, redirect.clobber)?;
+                    // rubash#3875: same adoption as the fd-1 leg above.
+                    if !self
+                        .pending_preopened_redirects
+                        .borrow()
+                        .get(&call_position)
+                        .is_some_and(|(recorded, _, _)| recorded == &target)
+                    {
+                        self.create_redirect_output_prepared_for(
+                            Some(redirect),
+                            &target,
+                            redirect.clobber,
+                        )?;
+                    }
                 }
                 let mut append_redirect = redirect.clone();
                 append_redirect.target = target;
@@ -1559,7 +1600,13 @@ impl Executor {
                             || call_cmd
                                 .heredoc_redirects
                                 .iter()
-                                .any(|redirect| redirect.fd.is_none() || redirect.fd == Some(0))
+                                // rubash#3894: a `{var}<<` twin binds an
+                                // allocated fd, never fd 0 — it is not
+                                // an fd-0 stdin body of the call.
+                                .any(|redirect| {
+                                    redirect.fd_var.is_none()
+                                        && (redirect.fd.is_none() || redirect.fd == Some(0))
+                                })
                     }
                 };
             if !call_has_own_stdin_body

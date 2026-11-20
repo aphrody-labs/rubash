@@ -73,6 +73,13 @@ struct CommandLookupCache {
     /// which itself stats the pinned POSIX tools dir) is pure overhead.
     path_dirs: Option<Arc<Vec<PathBuf>>>,
     path_extensions: Option<Arc<Vec<String>>>,
+    /// Per-scaffold flag: did PATH element N carry a `.`-leading spelling?
+    /// GNU findcmd.c:550-551 examines that spelling (not the anchored
+    /// directory) before each element's hit test and sets
+    /// dot_found_in_search when it resolves to the session cwd
+    /// (rubash#3551); the Windows listing walk needs the raw verdict for
+    /// the same CHKDOT record.
+    path_dot_elements: Option<Arc<Vec<bool>>>,
 }
 
 impl CommandLookupCache {
@@ -84,6 +91,7 @@ impl CommandLookupCache {
             probes: HashMap::new(),
             path_dirs: None,
             path_extensions: None,
+            path_dot_elements: None,
         }
     }
 
@@ -100,6 +108,7 @@ impl CommandLookupCache {
         self.probes.clear();
         self.path_dirs = None;
         self.path_extensions = None;
+        self.path_dot_elements = None;
     }
 }
 
@@ -169,6 +178,15 @@ struct CommandLookupStores {
     /// (the per-scope self-cap in set_command_lookup_cache); only the
     /// resolution slices' memory is bounded by CACHE_SLICE_CAP.
     hashed: HashMap<String, HashMap<String, Option<PathBuf>>>,
+    /// The session's `dot_found_in_search` (findcmd.c:78): GNU keeps it
+    /// as a global the PATH walk resets at entry (findcmd.c:632) and
+    /// sets whenever an element beginning with `.` resolves to the
+    /// current directory (findcmd.c:550-551); every phash_insert then
+    /// carries the verdict into the entry's HASH_CHKDOT flag
+    /// (findcmd.c:416-426, hashcmd.c:113-114). A lookup answered from
+    /// the hash table runs no walk and leaves the stale value — the
+    /// same quirk GNU's global exhibits for `hash -p` inserts.
+    dot_found: HashMap<String, bool>,
 }
 
 impl CommandLookupStores {
@@ -177,6 +195,7 @@ impl CommandLookupStores {
             slices: HashMap::new(),
             recency: VecDeque::new(),
             hashed: HashMap::new(),
+            dot_found: HashMap::new(),
         }
     }
 
@@ -315,6 +334,21 @@ pub(crate) fn clear_command_lookup_cache(env_vars: &HashMap<String, String>) {
     cache.reset(String::new());
 }
 
+/// The session's `dot_found_in_search` verdict, as left by the most
+/// recent PATH walk (findcmd.c:78). phash_insert consumers read it
+/// through builtins::hash; mirrors GNU's stale-after-a-hash-hit quirk.
+pub(crate) fn dot_found_in_search(env_vars: &HashMap<String, String>) -> bool {
+    let scope = session_scope(env_vars);
+    let stores = command_lookup_stores();
+    stores.dot_found.get(&scope).copied().unwrap_or(false)
+}
+
+fn set_dot_found_in_search(env_vars: &HashMap<String, String>, found: bool) {
+    let scope = session_scope(env_vars);
+    let mut stores = command_lookup_stores();
+    stores.dot_found.insert(scope, found);
+}
+
 /// Forget one remembered command location in the session that owns
 /// `env_vars`.
 ///
@@ -390,6 +424,25 @@ pub(crate) fn anchor_at_session_cwd(
         }
     }
     candidate
+}
+
+/// G-02 file-operand resolution for the builtins that open a user-named
+/// file in-process — `bind -f` and its `$include` reads (builtins/
+/// bind.def:274 rl_read_init_file; lib/readline/bind.c:1502
+/// parser_include) and the history file faces `-a/-n/-r/-w`
+/// (builtins/history.def:273,295-316): translate the spelling, then
+/// anchor a relative result at the session cwd — GNU's single cwd IS
+/// the session cwd here, so a relative operand names a file in the
+/// directory `cd` moved to, not the process cwd (rubash#3090). The
+/// empty operand passes through untranslated and unanchored so its
+/// open keeps GNU's ENOENT shape instead of resolving to the cwd
+/// directory itself. Diagnostics keep the as-typed spelling; only
+/// opens use this form.
+pub(crate) fn anchored_file_operand(name: &str, env_vars: &HashMap<String, String>) -> PathBuf {
+    if name.is_empty() {
+        return PathBuf::from(name);
+    }
+    anchor_at_session_cwd(shell_path_to_windows(name, env_vars), env_vars)
 }
 
 pub(crate) fn command_lookup_fingerprint(env_vars: &HashMap<String, String>) -> String {
@@ -649,15 +702,32 @@ pub fn find_user_command(name: &str, env_vars: &HashMap<String, String>) -> Opti
         // PATH-scan memo for the name is stale evidence then too.
         if let Some(result) = mirror.get(name).cloned() {
             if let Some(path) = &result {
-                match crate::builtins::hash::phash_search_spelling(
-                    &path.to_string_lossy(),
-                    env_vars,
-                ) {
+                // GNU hashcmd.c:146-191 phash_search's CHKDOT/RELPATH
+                // arm (rubash#3551): `./NAME` (or `./<stored>`) wins
+                // while executable, and a `.`-leading stored path
+                // resolving to `.` unexecutably is a miss — the PATH
+                // walk below then re-records (hash -p ./gone NAME falls
+                // through the same way). builtins::hash owns the arm; the
+                // mirror stores only the fs path. The served spelling is
+                // what GNU shell_execve runs verbatim (execute_cmd.c:6133
+                // hands the recorded string to execve unchanged), so this
+                // lookup returns its FILESYSTEM form: on unix the hash
+                // spelling already is that path; on Windows the table
+                // stores the shell-domain display form (/d/...,
+                // ./elem/name) and shell_path_to_windows — the same
+                // funnel record_command_resolution used to build the
+                // mirror — yields the spawnable path. Relative spellings
+                // stay relative, so a post-`cd` ENOENT keeps the
+                // `./elem/name` re-resolution of rubash#2696.
+                match crate::builtins::hash::phash_search(env_vars, name) {
                     None => {
+                        mirror.remove(name);
                         cache.results.remove(name);
                     }
                     Some(served) => {
-                        let served = PathBuf::from(served);
+                        let served = shell_path_to_windows(&served, env_vars);
+                        // checkhash probes the served spelling anchored
+                        // at the session cwd (G-02).
                         if crate::builtins::shopt::checkhash_enabled()
                             && !cached_path_still_valid(&anchor_at_session_cwd(
                                 served.clone(),
@@ -901,14 +971,22 @@ fn path_scan_scaffold(
     cache: &mut CommandLookupCache,
     env_vars: &HashMap<String, String>,
     fingerprint: &str,
-) -> (Arc<Vec<PathBuf>>, Arc<Vec<String>>) {
+) -> (Arc<Vec<PathBuf>>, Arc<Vec<String>>, Arc<Vec<bool>>) {
     if cache.fingerprint != fingerprint {
         cache.reset(fingerprint.to_string());
     }
     if cache.path_dirs.is_none() {
+        let mut dot_elements = Vec::new();
         let dirs = split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default())
             .into_iter()
             .map(|dir| {
+                // rubash#3826: GNU findcmd.c:544 — expand a `~`-leading
+                // PATH element at lookup time (unless POSIX mode).
+                let dir = expand_path_element_tilde(&dir, env_vars);
+                // findcmd.c:550-551 is keyed on the element SPELLING
+                // beginning with `.`, read before the element is joined
+                // and anchored (rubash#3551).
+                dot_elements.push(dir.starts_with('.'));
                 // rubash#3104: fold a raw-byte pair in the element
                 // before the listing scan, like the unix walk; on
                 // Windows the folded string is already the WTF-8
@@ -919,6 +997,7 @@ fn path_scan_scaffold(
             })
             .collect::<Vec<_>>();
         cache.path_dirs = Some(Arc::new(dirs));
+        cache.path_dot_elements = Some(Arc::new(dot_elements));
     }
     if cache.path_extensions.is_none() {
         cache.path_extensions = Some(Arc::new(executable_extensions(env_vars)));
@@ -926,6 +1005,7 @@ fn path_scan_scaffold(
     (
         Arc::clone(cache.path_dirs.as_ref().unwrap()),
         Arc::clone(cache.path_extensions.as_ref().unwrap()),
+        Arc::clone(cache.path_dot_elements.as_ref().unwrap()),
     )
 }
 
@@ -943,17 +1023,41 @@ fn find_in_path_via_listings(
     env_vars: &HashMap<String, String>,
     fingerprint: &str,
 ) -> Option<PathBuf> {
+    // findcmd.c:632 resets dot_found_in_search at walk entry;
+    // findcmd.c:550-551 then sets it whenever an element beginning with
+    // `.` resolves to the session cwd — including the element the hit
+    // lands in. The verdict rides the session's dot_found side channel
+    // for the next phash_insert (rubash#3551, Windows listing face).
+    let mut dot_found = false;
+    let result = find_in_path_via_listings_inner(name, env_vars, fingerprint, &mut dot_found);
+    set_dot_found_in_search(env_vars, dot_found);
+    result
+}
+
+#[cfg(not(unix))]
+fn find_in_path_via_listings_inner(
+    name: &str,
+    env_vars: &HashMap<String, String>,
+    fingerprint: &str,
+    dot_found: &mut bool,
+) -> Option<PathBuf> {
     let scope = session_scope(env_vars);
     let mut stores = command_lookup_stores();
     let cache = session_lookup_slice(&mut stores, &scope);
-    let (dirs, extensions) = path_scan_scaffold(cache, env_vars, fingerprint);
+    let (dirs, extensions, dot_elements) = path_scan_scaffold(cache, env_vars, fingerprint);
     // Candidate spellings are per-NAME, not per-directory (GNU passes the
     // same NAME through the whole walk); derive them once so a miss costs
     // one contains() per PATH entry per PATHEXT candidate and no
     // allocation at all.
     let candidates = listed_candidates(name, &extensions);
     for attempt in 0..2 {
-        for dir in dirs.iter() {
+        for (index, dir) in dirs.iter().enumerate() {
+            // findcmd.c:550-551: a `.`-spelled element that resolves to
+            // the session cwd sets dot_found_in_search, examined in PATH
+            // order before the hit test below (rubash#3551).
+            if !*dot_found && dot_elements[index] && path_element_is_session_cwd(dir, env_vars) {
+                *dot_found = true;
+            }
             let listing = cached_dir_listing(cache, dir);
             for candidate in &candidates {
                 // rubash#799 relaxed by rubash#1283: within one directory a
@@ -1135,7 +1239,7 @@ fn memoized_miss_still_absent(
     env_vars: &HashMap<String, String>,
     fingerprint: &str,
 ) -> bool {
-    let (dirs, extensions) = path_scan_scaffold(cache, env_vars, fingerprint);
+    let (dirs, extensions, _dot_elements) = path_scan_scaffold(cache, env_vars, fingerprint);
     let candidates = listed_candidates(name, &extensions);
     !confirm_listing_miss(cache, &dirs, &candidates).hit
 }
@@ -1152,9 +1256,15 @@ fn memoized_miss_still_absent(
     env_vars: &HashMap<String, String>,
     _fingerprint: &str,
 ) -> bool {
+    // rubash#3826: the probe must expand a `~`-leading element exactly
+    // like the walk does, or a memoized miss would be served for a
+    // command that is findable via the expanded element.
     !split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default())
         .iter()
-        .any(|dir| shell_path_to_windows(dir, env_vars).join(name).is_file())
+        .any(|dir| {
+            let dir = expand_path_element_tilde(dir, env_vars);
+            shell_path_to_windows(&dir, env_vars).join(name).is_file()
+        })
 }
 
 #[cfg_attr(unix, allow(unused_variables))]
@@ -1258,6 +1368,26 @@ fn find_user_command_uncached(
     None
 }
 
+/// GNU findcmd.c:544 `find_in_path_element`: a PATH element starting
+/// with `~` is tilde-expanded at lookup time — `xpath =
+/// (posixly_correct == 0 && *path == '~') ? bash_tilde_expand (path, 0)
+/// : path`. The expansion happens per element, inside the walk, so
+/// `command -v` / `hash -t` print the expanded path (rubash#3826).
+/// The `~` is NOT expanded when PATH is assigned (that is the
+/// assignment layer's business) and NOT in POSIX mode
+/// (`posixly_correct == 0` gate). Reuses the assignment-layer tilde
+/// helper: `~`/`~/...` via $HOME, `~+`/`~-`/`~N` via the dirstack,
+/// `~user[/rest]` via getpwnam; an unresolvable user stays verbatim.
+pub(crate) fn expand_path_element_tilde(dir: &str, env_vars: &HashMap<String, String>) -> String {
+    if !dir.starts_with('~') {
+        return dir.to_string();
+    }
+    if crate::builtins::set::shell_option_enabled(env_vars, "posix") {
+        return dir.to_string();
+    }
+    crate::expand::tilde::tilde::expand_tilde_segment(dir, env_vars)
+}
+
 /// The unix PATH-element walk behind `find_user_command_uncached`,
 /// returning the winning candidate in two forms: the session-cwd-anchored
 /// path the executor opens/spawns, and the as-written join of the PATH
@@ -1277,8 +1407,31 @@ fn find_in_path_walk_unix(
     env_vars: &HashMap<String, String>,
     name_had_transport: bool,
 ) -> Option<(PathBuf, String)> {
+    // findcmd.c:632 resets dot_found_in_search at walk entry;
+    // findcmd.c:550-551 then sets it whenever an element beginning
+    // with `.` resolves to the current directory — including the
+    // element the hit lands in. The verdict rides the session's
+    // dot_found side channel for the next phash_insert (rubash#3551).
+    let mut dot_found = false;
+    let result = find_in_path_walk_unix_inner(name, env_vars, name_had_transport, &mut dot_found);
+    set_dot_found_in_search(env_vars, dot_found);
+    result
+}
+
+#[cfg(unix)]
+fn find_in_path_walk_unix_inner(
+    name: &str,
+    env_vars: &HashMap<String, String>,
+    name_had_transport: bool,
+    dot_found: &mut bool,
+) -> Option<(PathBuf, String)> {
     let mut file_to_lose_on: Option<(PathBuf, String)> = None;
     for dir in split_shell_path(env_vars.get("PATH").map(String::as_str).unwrap_or_default()) {
+        // rubash#3826: GNU findcmd.c:544 — expand a `~`-leading PATH
+        // element at lookup time (unless POSIX mode), before the
+        // fold/probe, so the element the walk joins is the expanded
+        // home path.
+        let dir = expand_path_element_tilde(&dir, env_vars);
         // rubash#3104: a PATH element carrying a raw-byte pair must be
         // folded before the probe — GNU findcmd.c:623 walks with the
         // element bytes verbatim, and the unfolded pair spelling never
@@ -1318,6 +1471,15 @@ fn find_in_path_walk_unix(
             joined.to_string_lossy().into_owned()
         };
         let candidate = anchor_at_session_cwd(joined, env_vars);
+        // findcmd.c:550-551: an element beginning with `.` that resolves
+        // to the session cwd sets dot_found_in_search, examined in PATH
+        // order before the hit test below.
+        if !*dot_found && dir.starts_with('.') {
+            let anchored_dir = anchor_at_session_cwd(dir_fs.clone(), env_vars);
+            if path_element_is_session_cwd(&anchored_dir, env_vars) {
+                *dot_found = true;
+            }
+        }
         if !candidate.is_file() {
             continue;
         }
@@ -1329,6 +1491,22 @@ fn find_in_path_walk_unix(
         }
     }
     file_to_lose_on
+}
+
+/// findcmd.c:550-551 `same_file(".", xpath)` — whether a `.`-leading PATH
+/// element resolves to the session's current directory (device+inode
+/// equality, canonicalized here). Both faces need it: the unix stat walk
+/// and the Windows listing walk record the same CHKDOT verdict
+/// (rubash#3551).
+fn path_element_is_session_cwd(anchored_dir: &Path, env_vars: &HashMap<String, String>) -> bool {
+    let cwd = anchor_at_session_cwd(PathBuf::from("."), env_vars);
+    match (
+        std::fs::canonicalize(&cwd),
+        std::fs::canonicalize(anchored_dir),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// rubash#2317: the name a PATH search RECORDS for `name` — the as-written
@@ -1466,11 +1644,12 @@ pub(crate) fn drop_exe_probe_suffix(name: &str, display: String) -> String {
 /// to the resolved program ([`exec_name_for_program`]). Every route
 /// below resolves `program` from `name` under `env_vars` and births
 /// the child in the session cwd, which is what a relative join
-/// resolves against. The exec builtin is the one deliberate
-/// exception: exec.def:151 resolves through search_for_command but
-/// exec.def:172 then rebinds the target with `full_pathname` before
-/// shell_execve (exec.def:231), so its filename is the anchored
-/// absolute path and builtins/exec.rs stays off this funnel.
+/// resolves against. The exec builtin takes this funnel's name one
+/// step further: exec.def:151 resolves through search_for_command, and
+/// exec.def:172 then rebinds that word with `full_pathname` before
+/// shell_execve (exec.def:231), so its filename is the funnel's word
+/// made absolute against the cwd with one leading `./` removed
+/// (builtins/exec.rs full_pathname, rubash#3316).
 #[cfg(unix)]
 pub(crate) fn spawn_exec_name(
     name: &str,
@@ -1641,29 +1820,73 @@ pub fn should_run_with_shell(path: &Path) -> bool {
 /// "cannot execute binary file" / 126).
 ///
 /// Thin images, both byte orders: MH_MAGIC_64 (CF FA ED FE /
-/// FE ED FA CF) and MH_MAGIC (CE FA ED FE / FE ED FA CE).
+/// FE ED FA CF, `sizeof(struct mach_header_64)` = 32 bytes) and
+/// MH_MAGIC (CE FA ED FE / FE ED FA CE, `sizeof(struct mach_header)` =
+/// 28 bytes).
 ///
-/// The fat/universal wrapper shares its magic with Java class files
-/// (CAFEBABE); the arch count in bytes 4..8 disambiguates — a real fat
-/// binary carries a handful of slices, a class file carries a major
-/// version (>= 45) there. The count reads big-endian under FAT_MAGIC
-/// and little-endian under FAT_CIGAM.
+/// Fat/universal wrappers: FAT_MAGIC / FAT_CIGAM (CAFEBABE / BEBAFECA,
+/// `fat_header` 8 bytes + `nfat_arch * 20` bytes) and FAT_MAGIC_64 /
+/// FAT_CIGAM_64 (CAFEBABF / BFBAFECA, `fat_header` 8 bytes +
+/// `nfat_arch * 32` bytes). The arch count in bytes 4..8 also
+/// disambiguates CAFEBABE from Java class files (major version >= 45).
+/// Truncated headers fail validation so XNU's ENOEXEC refusal is
+/// preserved (rubash#3625).
+pub(crate) const MACHO_SNIFF_BYTES: usize = 8 + 16 * 32;
+
+pub(crate) fn read_exec_sniff_head(file: &mut std::fs::File, buf: &mut [u8]) -> usize {
+    use std::io::Read;
+    let mut total = 0;
+    while total < buf.len() {
+        match file.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    total
+}
+
 pub(crate) fn is_macho_binary_magic(head: &[u8]) -> bool {
     if head.len() < 4 {
         return false;
     }
-    match &head[..4] {
-        [0xCF, 0xFA, 0xED, 0xFE]
-        | [0xFE, 0xED, 0xFA, 0xCF]
-        | [0xCE, 0xFA, 0xED, 0xFE]
-        | [0xFE, 0xED, 0xFA, 0xCE] => true,
-        [0xCA, 0xFE, 0xBA, 0xBE] => {
-            head.len() >= 8
-                && (1..=16).contains(&u32::from_be_bytes([head[4], head[5], head[6], head[7]]))
-        }
-        [0xBE, 0xBA, 0xFE, 0xCA] => {
-            head.len() >= 8
-                && (1..=16).contains(&u32::from_le_bytes([head[4], head[5], head[6], head[7]]))
+    let magic = [head[0], head[1], head[2], head[3]];
+    match magic {
+        // Thin 32-bit: MH_MAGIC / MH_CIGAM (`sizeof(struct mach_header)` = 28).
+        [0xFE, 0xED, 0xFA, 0xCE] | [0xCE, 0xFA, 0xED, 0xFE] => head.len() >= 28,
+        // Thin 64-bit: MH_MAGIC_64 / MH_CIGAM_64 (`sizeof(struct mach_header_64)` = 32).
+        [0xFE, 0xED, 0xFA, 0xCF] | [0xCF, 0xFA, 0xED, 0xFE] => head.len() >= 32,
+        // Fat 32-bit (20-byte fat_arch) and Fat 64-bit (32-byte fat_arch_64).
+        [0xCA, 0xFE, 0xBA, 0xBE]
+        | [0xBE, 0xBA, 0xFE, 0xCA]
+        | [0xCA, 0xFE, 0xBA, 0xBF]
+        | [0xBF, 0xBA, 0xFE, 0xCA] => {
+            if head.len() < 8 {
+                return false;
+            }
+            let is_be = magic[0] == 0xCA;
+            let arch_size: usize = if magic[3] == 0xBF || magic[0] == 0xBF {
+                32
+            } else {
+                20
+            };
+            let count_bytes = [head[4], head[5], head[6], head[7]];
+            let nfat_arch = if is_be {
+                u32::from_be_bytes(count_bytes)
+            } else {
+                u32::from_le_bytes(count_bytes)
+            };
+            if !(1..=16).contains(&nfat_arch) {
+                return false;
+            }
+            let Some(required) = (nfat_arch as usize)
+                .checked_mul(arch_size)
+                .and_then(|n| n.checked_add(8))
+            else {
+                return false;
+            };
+            head.len() >= required
         }
         _ => false,
     }
@@ -1684,18 +1907,16 @@ pub(crate) fn is_macho_binary_magic(head: &[u8]) -> bool {
 /// execute binary file" refusal). Unreadable files answer true — the spawn
 /// error path below reports those, as today.
 pub fn program_execs_directly(path: &Path) -> bool {
-    use std::io::Read;
     let Ok(mut file) = std::fs::File::open(path) else {
         return true;
     };
-    let mut prefix = [0u8; 8];
-    // Read, not read_exact: a 4-7 byte file must still be judged on its
-    // real prefix (the pre-rework read_exact(4) did so; read_exact(8)
-    // returns true for every sub-8-byte file, so a 7-byte `echo hi`
-    // script would have been misread as directly exec-able). A file
-    // shorter than 4 bytes matches no magic and falls through to the
-    // script path, as GNU does (rubash#3510 rework).
-    let n = file.read(&mut prefix).unwrap_or(0);
+    let mut prefix = [0u8; MACHO_SNIFF_BYTES];
+    // Read until EOF or MACHO_SNIFF_BYTES (not read_exact): a short file
+    // must still be judged on its real prefix (e.g. a 7-byte `echo hi`
+    // script or a truncated Mach-O header). A file shorter than 4 bytes
+    // matches no magic and falls through to the script path, as GNU does
+    // (rubash#3510 rework, rubash#3625).
+    let n = read_exec_sniff_head(&mut file, &mut prefix);
     let prefix = &prefix[..n];
     prefix.starts_with(b"#!")
         || prefix.starts_with(&[0x7F, b'E', b'L', b'F'])
@@ -1926,8 +2147,8 @@ pub fn external_command_for_named_program(
 /// funnel, [`spawn_exec_name`] (rubash#2442): every spawn route that
 /// resolves its program from a typed word passes one — plain
 /// foreground, pipeline stages, command substitution, the `env`
-/// wrapper. The exec builtin is the documented exception (see
-/// [`spawn_exec_name`]).
+/// wrapper. The exec builtin passes the funnel's name rebound by
+/// full_pathname (see [`spawn_exec_name`]).
 pub fn external_command_for_named_program_with_exec_name(
     program: &Path,
     command_name: Option<&str>,
@@ -3941,9 +4162,16 @@ fn file_is_executable(path: &Path) -> bool {
 
 /// GNU hashcmd.c phash_search: `hash -t` resolves a stored relative path
 /// through its `./`-prefixed form when that form is executable.
+/// GNU findcmd.c:214-223 `executable_file` requires FS_EXECABLE **and**
+/// not a directory: a bare access(X_OK) admits every directory (search
+/// permission), which made `phash_search_spelling` return `"./"` for a
+/// stored empty path (rubash#3824) and let `hash`/`type -a` accept
+/// non-executable files (rubash#3825). `is_dir` stats through symlinks,
+/// matching file_status's stat: a symlink to a directory is out, a
+/// symlink to an executable file is in, a dangling symlink fails access.
 #[cfg(unix)]
 pub(crate) fn is_executable_file(path: &Path) -> bool {
-    file_is_executable(path)
+    !path.is_dir() && file_is_executable(path)
 }
 
 #[cfg(not(unix))]
@@ -5110,34 +5338,88 @@ mod tests {
         assert_eq!(process_path_to_shell("/usr/bin:/bin"), "/usr/bin:/bin");
     }
 
-    /// rubash#3510 rework: Mach-O native-image magics — thin 32/64-bit in
-    /// both byte orders, plus the fat/universal wrapper disambiguated from
-    /// Java class files (same CAFEBABE magic) by the arch count.
+    /// rubash#3510 rework + rubash#3625: Mach-O native-image magics —
+    /// thin 32/64-bit in both byte orders (28/32-byte mach_header),
+    /// plus fat/fat64 wrappers (8-byte fat_header + nfat_arch * 20/32)
+    /// disambiguated from Java class files (same CAFEBABE magic) by the
+    /// arch count. Truncated headers must be rejected.
     #[test]
     fn macho_binary_magic_recognizes_thin_and_fat_images() {
-        // Thin 64-bit, little- and big-endian.
-        assert!(is_macho_binary_magic(&[0xCF, 0xFA, 0xED, 0xFE]));
-        assert!(is_macho_binary_magic(&[0xFE, 0xED, 0xFA, 0xCF]));
-        // Thin 32-bit, little- and big-endian.
-        assert!(is_macho_binary_magic(&[0xCE, 0xFA, 0xED, 0xFE]));
-        assert!(is_macho_binary_magic(&[0xFE, 0xED, 0xFA, 0xCE]));
-        // Fat, 2 slices — the universal-binary shape.
-        assert!(is_macho_binary_magic(&[
-            0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02
-        ]));
-        assert!(is_macho_binary_magic(&[
-            0xBE, 0xBA, 0xFE, 0xCA, 0x02, 0x00, 0x00, 0x00
-        ]));
+        let with_len = |magic: [u8; 4], len: usize| {
+            let mut buf = vec![0u8; len];
+            buf[..4].copy_from_slice(&magic);
+            buf
+        };
+        let fat_with_len = |magic: [u8; 4], count_bytes: [u8; 4], len: usize| {
+            let mut buf = vec![0u8; len];
+            buf[..4].copy_from_slice(&magic);
+            buf[4..8].copy_from_slice(&count_bytes);
+            buf
+        };
+
+        // Thin 64-bit, little- and big-endian: requires 32 bytes.
+        for magic in [[0xCF, 0xFA, 0xED, 0xFE], [0xFE, 0xED, 0xFA, 0xCF]] {
+            assert!(!is_macho_binary_magic(&magic));
+            assert!(!is_macho_binary_magic(&with_len(magic, 31)));
+            assert!(is_macho_binary_magic(&with_len(magic, 32)));
+        }
+        // Thin 32-bit, little- and big-endian: requires 28 bytes.
+        for magic in [[0xCE, 0xFA, 0xED, 0xFE], [0xFE, 0xED, 0xFA, 0xCE]] {
+            assert!(!is_macho_binary_magic(&magic));
+            assert!(!is_macho_binary_magic(&with_len(magic, 27)));
+            assert!(is_macho_binary_magic(&with_len(magic, 28)));
+        }
+        // Fat 32-bit, 2 slices: requires 8 + 2 * 20 = 48 bytes.
+        for (magic, count) in [
+            ([0xCA, 0xFE, 0xBA, 0xBE], 2u32.to_be_bytes()),
+            ([0xBE, 0xBA, 0xFE, 0xCA], 2u32.to_le_bytes()),
+        ] {
+            assert!(!is_macho_binary_magic(&magic));
+            assert!(!is_macho_binary_magic(&fat_with_len(magic, count, 8)));
+            assert!(!is_macho_binary_magic(&fat_with_len(magic, count, 47)));
+            assert!(is_macho_binary_magic(&fat_with_len(magic, count, 48)));
+        }
+        // Fat 64-bit, 2 slices: requires 8 + 2 * 32 = 72 bytes.
+        for (magic, count) in [
+            ([0xCA, 0xFE, 0xBA, 0xBF], 2u32.to_be_bytes()),
+            ([0xBF, 0xBA, 0xFE, 0xCA], 2u32.to_le_bytes()),
+        ] {
+            assert!(!is_macho_binary_magic(&magic));
+            assert!(!is_macho_binary_magic(&fat_with_len(magic, count, 8)));
+            assert!(!is_macho_binary_magic(&fat_with_len(magic, count, 71)));
+            assert!(is_macho_binary_magic(&fat_with_len(magic, count, 72)));
+        }
+        // Max supported fat64 slice count (16): requires 8 + 16 * 32 = 520 bytes.
+        assert!(!is_macho_binary_magic(&fat_with_len(
+            [0xCA, 0xFE, 0xBA, 0xBF],
+            16u32.to_be_bytes(),
+            519,
+        )));
+        assert!(is_macho_binary_magic(&fat_with_len(
+            [0xCA, 0xFE, 0xBA, 0xBF],
+            16u32.to_be_bytes(),
+            520,
+        )));
         // A Java class file shares FAT_MAGIC but carries a major version
         // (>= 45) where the arch count sits — not a Mach-O image.
-        assert!(!is_macho_binary_magic(&[
-            0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34
-        ]));
-        assert!(!is_macho_binary_magic(&[
-            0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x00
-        ]));
-        // A 4-byte fat prefix cannot carry the count — not recognized.
-        assert!(!is_macho_binary_magic(&[0xCA, 0xFE, 0xBA, 0xBE]));
+        assert!(!is_macho_binary_magic(&fat_with_len(
+            [0xCA, 0xFE, 0xBA, 0xBE],
+            0x34u32.to_be_bytes(),
+            128,
+        )));
+        // Invalid / out-of-range arch counts (0, 17, u32::MAX) are rejected.
+        for count in [0u32, 17, u32::MAX] {
+            assert!(!is_macho_binary_magic(&fat_with_len(
+                [0xCA, 0xFE, 0xBA, 0xBE],
+                count.to_be_bytes(),
+                64,
+            )));
+            assert!(!is_macho_binary_magic(&fat_with_len(
+                [0xCA, 0xFE, 0xBA, 0xBF],
+                count.to_be_bytes(),
+                64,
+            )));
+        }
         // Everything else is not Mach-O.
         assert!(!is_macho_binary_magic(&[0x7F, b'E', b'L', b'F']));
         assert!(!is_macho_binary_magic(b"#!/bin/sh"));
@@ -5147,14 +5429,12 @@ mod tests {
         assert!(!is_macho_binary_magic(&[0xCF, 0xFA, 0xED]));
     }
 
-    /// rubash#3510 rework: the two pre-emptive native-binary classifiers
-    /// treat Mach-O images by platform — admitted on macOS, where the
-    /// Darwin kernel execs them (the macOS face where /bin/sleep,
-    /// MH_MAGIC_64, was refused as "cannot execute binary file" / 126
-    /// before any execve was attempted), and still refused elsewhere,
-    /// where the kernel answers ENOEXEC and GNU's post-ENOEXEC binary
-    /// refusal (126) applies. A Java class file (FAT_MAGIC, major
-    /// version in the count slot) stays a non-native file on both.
+    /// rubash#3510 rework + rubash#3625: the two pre-emptive native-binary
+    /// classifiers treat valid Mach-O images by platform — admitted on
+    /// macOS, where the Darwin kernel execs them, and still refused
+    /// elsewhere, where the kernel answers ENOEXEC. Truncated Mach-O
+    /// headers (< mach_header / < fat_header + nfat_arch * arch) are
+    /// rejected on every platform, matching XNU's ENOEXEC refusal.
     #[cfg(unix)]
     #[test]
     fn native_binary_classifiers_admit_macho_images() {
@@ -5167,36 +5447,34 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         };
-        // Thin Mach-O 64-bit (the /bin/sleep shape: magic + arm64 cputype).
-        let thin = write_exec(
-            "thin-macho",
-            &[
-                0xCF, 0xFA, 0xED, 0xFE, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-            ],
-        );
-        // Fat universal binary, 2 slices.
-        let fat = write_exec(
-            "fat-macho",
-            &[
-                0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
-            ],
-        );
+        // Thin Mach-O 64-bit (32-byte mach_header_64).
+        let mut thin_bytes = vec![0u8; 32];
+        thin_bytes[..8].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE, 0x0C, 0x00, 0x00, 0x01]);
+        let thin = write_exec("thin-macho", &thin_bytes);
+        // Fat universal binary, 2 slices (8 + 2 * 20 = 48 bytes).
+        let mut fat_bytes = vec![0u8; 48];
+        fat_bytes[..8].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02]);
+        let fat = write_exec("fat-macho", &fat_bytes);
+        // Fat64 universal binary, 2 slices (8 + 2 * 32 = 72 bytes).
+        let mut fat64_bytes = vec![0u8; 72];
+        fat64_bytes[..8].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBF, 0x00, 0x00, 0x00, 0x02]);
+        let fat64 = write_exec("fat64-macho", &fat64_bytes);
+        // Truncated Mach-O files: magic matches, header is incomplete.
+        let truncated_thin = write_exec("truncated-thin", &thin_bytes[..12]);
+        let truncated_fat = write_exec("truncated-fat", &fat_bytes[..12]);
+        let truncated_fat64 = write_exec("truncated-fat64", &fat64_bytes[..40]);
         // Java class file: same FAT_MAGIC, major version 52 in the count slot.
-        let class = write_exec(
-            "java-class",
-            &[
-                0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00,
-            ],
-        );
+        let mut class_bytes = vec![0u8; 64];
+        class_bytes[..8].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34]);
+        let class = write_exec("java-class", &class_bytes);
         // Shebangless text: the genuine ENOEXEC-candidate shape.
         let text = write_exec("plain-text", b"echo hi\n");
         // Sub-8-byte shebangless scripts: judged on their real prefix, not
-        // on a short-read failure (read_exact(8) misread these as directly
-        // exec-able). `echo hi` without a trailing newline is 7 bytes.
+        // on a short-read failure.
         let short_text = write_exec("short-text", b"echo hi");
         let tiny_text = write_exec("tiny-text", b"abc");
         if cfg!(target_os = "macos") {
-            for path in [&thin, &fat] {
+            for path in [&thin, &fat, &fat64] {
                 assert!(program_execs_directly(path), "{}", path.display());
                 assert!(
                     !crate::executor::external_inner::is_enoexec_candidate(path),
@@ -5207,7 +5485,7 @@ mod tests {
         } else {
             // Off macOS the kernel refuses Mach-O with ENOEXEC, so both
             // classifiers keep it on the refusal path (GNU: 126).
-            for path in [&thin, &fat] {
+            for path in [&thin, &fat, &fat64] {
                 assert!(!program_execs_directly(path), "{}", path.display());
                 assert!(
                     crate::executor::external_inner::is_enoexec_candidate(path),
@@ -5215,6 +5493,14 @@ mod tests {
                     path.display()
                 );
             }
+        }
+        for path in [&truncated_thin, &truncated_fat, &truncated_fat64] {
+            assert!(!program_execs_directly(path), "{}", path.display());
+            assert!(
+                crate::executor::external_inner::is_enoexec_candidate(path),
+                "{}",
+                path.display()
+            );
         }
         assert!(!program_execs_directly(&class));
         assert!(crate::executor::external_inner::is_enoexec_candidate(
@@ -5230,7 +5516,18 @@ mod tests {
                 path.display()
             );
         }
-        for path in [&thin, &fat, &class, &text, &short_text, &tiny_text] {
+        for path in [
+            &thin,
+            &fat,
+            &fat64,
+            &truncated_thin,
+            &truncated_fat,
+            &truncated_fat64,
+            &class,
+            &text,
+            &short_text,
+            &tiny_text,
+        ] {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -8475,6 +8772,53 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn hash_consult_returns_spawnable_fs_path_for_display_spelling() {
+        // rubash#3845 (introduced by #3554's verbatim-served return):
+        // the hash-table consult must hand back the FILESYSTEM path of
+        // the served spelling. The table stores the shell-domain
+        // display form (/x/...) for `hash -t` fidelity; feeding that
+        // spelling to Command::new spawn routes ENOENTs — the
+        // issue1230 comsub pipeline-stage diagnostic on stderr.
+        // GNU execute_cmd.c:6133 shell_execve execve()s the recorded
+        // string, which on unix already IS the fs path; on Windows the
+        // fs form comes from shell_path_to_windows, the same funnel
+        // record_command_resolution used to build the mirror.
+        let dir = std::env::temp_dir().join(format!("rubash-3845-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("rubash3845tool.exe");
+        fs::write(&tool, b"MZ").unwrap();
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("PATH".to_string(), dir.to_string_lossy().into_owned());
+        env_vars.insert("PWD".to_string(), dir.to_string_lossy().into_owned());
+        // The recorded spelling is the shell-domain display form,
+        // exactly what record_command_resolution stores for a
+        // PATH-walk hit; the mirror entry is its fs-path twin.
+        let display = crate::executor::execution_misc::shell_display_path(
+            &tool.to_string_lossy().replace('\\', "/"),
+        );
+        let sep = crate::executor::markers::HASH_ENV_FIELD_SEP;
+        env_vars.insert(
+            "__RUBASH_HASH_TABLE".to_string(),
+            format!("rubash3845tool={display}{sep}1{sep}0{sep}0"),
+        );
+        set_command_lookup_cache("rubash3845tool", Some(tool.clone()), &env_vars);
+
+        let found =
+            find_user_command("rubash3845tool", &env_vars).expect("hashed command resolves");
+        assert!(
+            found.is_file(),
+            "hash consult must return the spawnable fs path, got {}",
+            found.display()
+        );
+        assert_eq!(found.canonicalize().unwrap(), tool.canonicalize().unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn windows_shell_path(path: &Path) -> String {
         let value = path.to_string_lossy().replace('\\', "/");
         let bytes = value.as_bytes();
@@ -8525,6 +8869,86 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 pub(crate) fn canonicalize_native(path: &Path) -> io::Result<PathBuf> {
     path.canonicalize()
         .map(|resolved| strip_verbatim_prefix(&resolved))
+}
+
+/// Whether the kernel would let this process search (chdir into)
+/// `path`: access(2) X_OK on a directory. The sibling of
+/// `file_is_executable` below, for directories instead of files —
+/// the same real-uid access(2) GNU's findcmd.c file_status uses
+/// (rubash#3788).
+///
+/// Unix-only semantics: Windows has no unix permission-bit
+/// semantics, so every directory qualifies there.
+#[cfg(unix)]
+pub(crate) fn directory_has_search_permission(path: &Path) -> bool {
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: access(2) with a NUL-terminated path.
+    unsafe { libc::access(cpath.as_ptr(), libc::X_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn directory_has_search_permission(_path: &Path) -> bool {
+    true
+}
+
+/// The error chdir would have reported for a target that exists but
+/// is not a directory (ENOTDIR / ERROR_DIRECTORY), in a form
+/// `posix_errors::message` renders as "Not a directory".
+fn not_a_directory_error() -> io::Error {
+    #[cfg(windows)]
+    {
+        io::Error::from_raw_os_error(267)
+    }
+    #[cfg(not(windows))]
+    {
+        io::Error::from_raw_os_error(20)
+    }
+}
+
+/// The error chdir would have reported for a target the process may
+/// not search (EACCES / ERROR_ACCESS_DENIED), in a form
+/// `posix_errors::message` renders as "Permission denied".
+fn search_denied_error() -> io::Error {
+    #[cfg(windows)]
+    {
+        io::Error::from_raw_os_error(5)
+    }
+    #[cfg(not(windows))]
+    {
+        io::Error::from_raw_os_error(libc::EACCES)
+    }
+}
+
+/// Probe a directory the way `chdir(2)` would, for the session-cwd
+/// moves (G-02): canonicalize (which carries chdir's ENOENT/ENOTDIR/
+/// EACCES for every component the walk traverses) + the directory
+/// check, PLUS the search-permission check on the target itself.
+///
+/// GNU builtins/cd.def change_to_directory performs a real chdir,
+/// and the kernel refuses a target without the search (execute) bit
+/// with EACCES — while realpath(3) and stat(2) both succeed on such
+/// a directory, because path resolution only needs search permission
+/// on the PARENT components, not on the final component itself. A
+/// probe built from canonicalize + is_dir therefore reports success
+/// for a directory the shell can never enter (rubash#3788):
+/// `cd`/`pushd` bound PWD/DIRSTACK to a directory the process never
+/// moved to. The session-cwd model never chdirs the process, so the
+/// permission half of chdir's verdict is reproduced here with
+/// access(2) X_OK on the resolved directory — root still passes, as
+/// with a real chdir, and ACLs are honored because the kernel itself
+/// adjudicates. The check is a no-op on Windows (no unix
+/// permission-bit semantics there).
+pub(crate) fn probe_directory_for_chdir(path: &Path) -> io::Result<PathBuf> {
+    let resolved = canonicalize_native(path)?;
+    if !resolved.is_dir() {
+        return Err(not_a_directory_error());
+    }
+    if !directory_has_search_permission(&resolved) {
+        return Err(search_denied_error());
+    }
+    Ok(resolved)
 }
 
 /// The canonical PWD display form: always the POSIX `/<drive>/…` spelling

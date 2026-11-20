@@ -123,7 +123,29 @@ impl Executor {
         // search_for_command (and with it the hash record above) runs
         // before the fork whose child opens redirections, so the
         // redirect-killed path records too (rubash#2518).
-        if self.apply_redirect_setup_side_effects(cmd)? {
+        // rubash#3828: the walk's probe opens each plain-file target
+        // once and drops the File — correct only when an emulation arm
+        // below actually answers (those bodies re-open their fd 1/2
+        // mirrors when they write). A command that falls through to
+        // the real exec path gets its redirects from
+        // execute_external_inner's own preflight walk; running this
+        // walk first creates the target under the umask-stripped mode
+        // and the preflight's open then fails EACCES although GNU's
+        // single do_redirections open succeeds (redir.c:237). Skip the
+        // walk unless an arm will emulate — the literal-file gates
+        // inside the pwd/printf arms decline to the real exec path
+        // the same way a non-listed name does. The retained variant
+        // carries the probe's FileFd to the emulation arm's bind so the
+        // entry still opens exactly once (h2).
+        let literal_file_declines =
+            matches!(
+                name,
+                "/bin/pwd" | "/usr/bin/pwd" | "/bin/printf" | "/usr/bin/printf"
+            ) && crate::executor::path::literal_executable_file(name, &self.shell_state.env_vars);
+        if emulated
+            && !literal_file_declines
+            && self.apply_redirect_setup_side_effects_retained(cmd)?
+        {
             self.record_emulated_command_resolution(name, emulated);
             return Ok(true);
         }
@@ -1880,10 +1902,15 @@ impl Executor {
                     continue;
                 }
 
+                // GNU copy.c copy_dir/copy_internal: each node
+                // diagnoses its own failure — `cannot create regular
+                // file` / `cannot create directory` naming THAT node —
+                // and a failed tree child does not stop its siblings
+                // (rubash#3635). The Err is already reported.
                 let result = if source.is_dir() {
-                    cp_copy_tree(&source, &target, 0, preserve, &mut link_map)
+                    cp_copy_tree(&source, &target, 0, preserve, &mut link_map, &mut stderr)
                 } else {
-                    cp_copy_file(&source, &target, preserve, &mut link_map)
+                    cp_copy_file(&source, &target, preserve, &mut link_map, &mut stderr)
                 };
                 match result {
                     Ok(_) => {
@@ -1909,24 +1936,7 @@ impl Executor {
                             );
                         }
                     }
-                    Err(error) => {
-                        // GNU coreutils copy.c copy_internal names the
-                        // kind it failed to create: `cannot create
-                        // regular file` for plain targets, `cannot
-                        // create directory` for the tree branch.
-                        let kind = if source.is_dir() {
-                            "directory"
-                        } else {
-                            "regular file"
-                        };
-                        let _ = writeln!(
-                            stderr,
-                            "cp: cannot create {kind} '{}': {}",
-                            target.display_path().display(),
-                            crate::posix_errors::message(&error)
-                        );
-                        status = 1;
-                    }
+                    Err(_) => status = 1,
                 }
             }
         }
@@ -2721,6 +2731,21 @@ impl Executor {
             return Ok(true);
         }
 
+        // rubash#3792: no operands and fd 0 is a `<&N` dup of a
+        // write-only fd — GNU cat's read fails EBADF. The text
+        // channel declined above (it serves no bytes for a dup of a
+        // write-only description), and the plain-stdin fall-through
+        // below would otherwise read the pipe/process stdin or
+        // decline to a spawn that no longer exists on this path.
+        // The check sits beside the closed-stdin check, before any
+        // stdin serve, so a pipeline stage's FUNCTION_STDIN never
+        // pre-empts it.
+        if self.cat_stdin_write_only_dup_source(cmd).is_some() {
+            self.report_cat_write_only_dup_stdin(cmd)?;
+            self.exit_code = 1;
+            return Ok(true);
+        }
+
         if let Some(input) = self.stdin_string_for_command_mut(cmd) {
             self.write_cat_output(
                 cmd,
@@ -2824,6 +2849,54 @@ impl Executor {
         self.fd_table.is_closed(0)
     }
 
+    /// rubash#3792: the fd-0 stdin winner is a `<&N` dup of a fd that is
+    /// open WRITE-only (no read endpoint, but a live write endpoint —
+    /// `exec 3>f`). GNU dup2'd that descriptor onto fd 0 (redir.c:1193),
+    /// so cat's own reads fail EBADF. Only the dup SPELLING counts: an
+    /// fd-alias path spelling (`< /dev/fd/N`) is an open over the alias
+    /// layer (#1963) and reads the target fine. An in-list source
+    /// (`cmd 3>f1 <&3`) is not covered — the ambient table holds no
+    /// binding for it yet; see REPORT.
+    fn cat_stdin_write_only_dup_source(&self, cmd: &CommandNode) -> Option<u32> {
+        if let Some(winner) = super::shell_options::fd0_stdin_redirect_winner(cmd) {
+            if !matches!(winner, crate::parser::RedirectKind::DuplicateInput) {
+                return None;
+            }
+        }
+        let redirect = cmd.redirect_in.as_ref()?;
+        if redirect.fd.unwrap_or(0) != 0
+            || !matches!(redirect.kind, crate::parser::RedirectKind::DuplicateInput)
+        {
+            return None;
+        }
+        let target = self.expand_redirect_target(redirect);
+        if !target.starts_with('&') {
+            return None;
+        }
+        let (source, _) = crate::executor::execution_misc::redirect_target_fd_and_move(&target)?;
+        if self.fd_table.read_endpoint(source).is_some() {
+            return None;
+        }
+        if self.fd_table.write_endpoint(source).is_some() {
+            return Some(source);
+        }
+        None
+    }
+
+    /// GNU coreutils cat on a dup'd write-only stdin (cat.c): the read
+    /// fails EBADF and cat reports exactly ONE line. The close of
+    /// standard input succeeds on a write-only descriptor, unlike the
+    /// closed-stdin face below, whose failing close earns a second
+    /// line. The line is cat's OWN stderr, written bare (rubash#1596 /
+    /// rubash#1309: no shell envelope).
+    fn report_cat_write_only_dup_stdin(&mut self, cmd: &CommandNode) -> Result<(), ExecuteError> {
+        let prog = cmd.words.first().map(String::as_str).unwrap_or("cat");
+        let mut stderr = Vec::new();
+        writeln!(&mut stderr, "{prog}: -: Bad file descriptor")?;
+        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        Ok(())
+    }
+
     /// GNU coreutils cat on a closed stdin (cat.c): the read fails and the
     /// close of standard input fails too — two diagnostics, and the caller
     /// sets exit status 1. The lines are cat's OWN stderr, written bare:
@@ -2850,6 +2923,18 @@ impl Executor {
         use std::io::Read;
         if let Some(input) = self.stdin_string_for_command_mut(cmd) {
             return crate::executor::substitution_metadata::shell_text_to_raw_bytes(&input);
+        }
+        // rubash#3792: the `-' operand's stdin is a `<&N` dup of a
+        // write-only fd — the text channel declined above (the dup
+        // serves no bytes; its reads fail EBADF), and fd 0 was never
+        // rebound, so the fall-throughs below would hand back an
+        // empty stream and exit 0. Record the hard read error the
+        // #2101 face already reports for the `-' operand
+        // (`{prog}: -: ...`, status 1); the caller takes it from
+        // fd_table.read_error.
+        if self.cat_stdin_write_only_dup_source(cmd).is_some() {
+            self.fd_table.read_error = Some("Bad file descriptor".to_string());
+            return Vec::new();
         }
         if !matches!(
             self.fd_table.read_endpoint(0),
@@ -5026,65 +5111,202 @@ impl CpNode {
     }
 }
 
-/// Copy one regular file, honoring --preserve=links: a source inode
-/// already copied in this invocation links the new destination to
+/// The Err a cp_copy_* site returns once its diagnostic is already
+/// written to the command's stderr buffer: callers only test is_err
+/// (the tree walk continues with the remaining siblings, GNU copy.c
+/// copy_dir's `ok &=` shape), so the payload is never rendered
+/// (rubash#3635).
+fn cp_diagnosed() -> io::Error {
+    io::Error::new(io::ErrorKind::Other, "cp: failure already diagnosed")
+}
+
+/// Copy one non-directory node, honoring --preserve=links: a source
+/// inode already copied in this invocation links the new destination to
 /// the first copy instead of duplicating the bytes (the two
 /// destinations then share an inode, mode and times included —
-/// exactly GNU's result).
+/// exactly GNU's result). Failures are diagnosed at the node itself,
+/// GNU copy.c copy_internal style, so a tree walk can continue with
+/// the siblings (rubash#3635).
 fn cp_copy_file(
     source: &CpNode,
     target: &CpNode,
     preserve: CpPreserve,
     link_map: &mut CpLinkMap,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
+    // copy.c copy_internal's overwrite gate: a non-directory source
+    // never lands on an existing directory. The destination is
+    // lstat'd — a symlink (even to a directory) is not S_ISDIR there,
+    // so it falls through to the create, whose open then fails
+    // against the linked directory.
+    if target
+        .symlink_stat()
+        .map(|stat| stat.is_dir)
+        .unwrap_or(false)
+    {
+        let _ = writeln!(
+            stderr,
+            "cp: cannot overwrite directory '{}' with non-directory",
+            target.display_path().display()
+        );
+        return Err(cp_diagnosed());
+    }
     if preserve.links {
         if let Some(key) = source.inode_key() {
             if let Some(first) = link_map.get(&key) {
-                return first.hard_link_to(target);
+                return first.hard_link_to(target).map_err(|error| {
+                    // copy.c create_hard_link: dst named first, then
+                    // the source it links to.
+                    let _ = writeln!(
+                        stderr,
+                        "cp: cannot create hard link '{}' to '{}': {}",
+                        target.display_path().display(),
+                        source.display_path().display(),
+                        crate::posix_errors::message(&error)
+                    );
+                    cp_diagnosed()
+                });
             }
-            let copied = source.copy_bytes_to(target);
+            let copied = source.copy_bytes_to(target).map_err(|error| {
+                let _ = writeln!(
+                    stderr,
+                    "cp: cannot create regular file '{}': {}",
+                    target.display_path().display(),
+                    crate::posix_errors::message(&error)
+                );
+                cp_diagnosed()
+            });
             if copied.is_ok() {
                 link_map.insert(key, target.clone());
             }
             return copied;
         }
     }
-    source.copy_bytes_to(target)
+    source.copy_bytes_to(target).map_err(|error| {
+        let _ = writeln!(
+            stderr,
+            "cp: cannot create regular file '{}': {}",
+            target.display_path().display(),
+            crate::posix_errors::message(&error)
+        );
+        cp_diagnosed()
+    })
 }
 
 /// cp -r: directories are created and walked in sorted entry order so the
 /// result is deterministic. Symlinks are followed, which is cp's default
 /// (without -d); the depth cap turns a link cycle into an error instead of
 /// a stack overflow.
+///
+/// Diagnostics are emitted at the failing node, GNU copy.c
+/// copy_internal style — `cannot create regular file` /
+/// `cannot create directory` naming THAT node — and a failed child
+/// does not stop its siblings, copy_dir's `ok &=` loop shape
+/// (rubash#3635). Every Err returned here has already been written
+/// to `stderr`; callers test is_err only.
 fn cp_copy_tree(
     source: &CpNode,
     target: &CpNode,
     depth: usize,
     preserve: CpPreserve,
     link_map: &mut CpLinkMap,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
     if depth > 40 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "too many levels of symbolic links",
-        ));
-    }
-    let metadata = source.symlink_stat()?;
-    if metadata.is_symlink {
-        return cp_copy_tree(
-            &source.resolve_link()?,
-            target,
-            depth + 1,
-            preserve,
-            link_map,
+        let _ = writeln!(
+            stderr,
+            "cp: cannot stat '{}': Too many levels of symbolic links",
+            source.display_path().display()
         );
+        return Err(cp_diagnosed());
+    }
+    let metadata = match source.symlink_stat() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "cp: cannot stat '{}': {}",
+                source.display_path().display(),
+                crate::posix_errors::message(&error)
+            );
+            return Err(cp_diagnosed());
+        }
+    };
+    if metadata.is_symlink {
+        return match source.resolve_link() {
+            Ok(resolved) => cp_copy_tree(&resolved, target, depth + 1, preserve, link_map, stderr),
+            Err(error) => {
+                let _ = writeln!(
+                    stderr,
+                    "cp: cannot stat '{}': {}",
+                    source.display_path().display(),
+                    crate::posix_errors::message(&error)
+                );
+                Err(cp_diagnosed())
+            }
+        };
     }
     if metadata.is_dir {
-        target.create_dir_all()?;
-        let mut entries = source.read_dir_nodes()?;
+        // copy.c copy_internal's overwrite gate, lstat'd like dst_sb:
+        // a directory source never lands on an existing
+        // non-directory — a symlink counts as non-directory even
+        // when it resolves to one.
+        match target.symlink_stat() {
+            Ok(stat) if !stat.is_dir => {
+                let _ = writeln!(
+                    stderr,
+                    "cp: cannot overwrite non-directory '{}' with directory '{}'",
+                    target.display_path().display(),
+                    source.display_path().display()
+                );
+                return Err(cp_diagnosed());
+            }
+            // An existing directory takes the contents — the
+            // `new_dst || !S_ISDIR(dst)` gate skips the mkdir.
+            Ok(_) => {}
+            Err(_) => {
+                // mkdirat is single-level (copy.c): a missing
+                // intermediate component is ENOENT, not a silent
+                // create_dir_all.
+                if let Err(error) = target.create_dir() {
+                    let _ = writeln!(
+                        stderr,
+                        "cp: cannot create directory '{}': {}",
+                        target.display_path().display(),
+                        crate::posix_errors::message(&error)
+                    );
+                    return Err(cp_diagnosed());
+                }
+            }
+        }
+        let mut entries = match source.read_dir_nodes() {
+            Ok(entries) => entries,
+            Err(error) => {
+                // copy_dir's savedir failure is `cannot access`.
+                let _ = writeln!(
+                    stderr,
+                    "cp: cannot access '{}': {}",
+                    source.display_path().display(),
+                    crate::posix_errors::message(&error)
+                );
+                return Err(cp_diagnosed());
+            }
+        };
         entries.sort_by_key(|(name, _)| name.clone());
+        let mut ok = true;
         for (name, child) in entries {
-            cp_copy_tree(&child, &target.child(&name), depth + 1, preserve, link_map)?;
+            if cp_copy_tree(
+                &child,
+                &target.child(&name),
+                depth + 1,
+                preserve,
+                link_map,
+                stderr,
+            )
+            .is_err()
+            {
+                ok = false;
+            }
         }
         // GNU sets a copied directory's preserved attributes only after
         // its contents land, so child writes cannot clobber them.
@@ -5092,9 +5314,9 @@ fn cp_copy_tree(
             cp_apply_preserved(source, target, preserve.mode, preserve.times);
         }
         cp_apply_preserved_attributes(source, target, preserve);
-        return Ok(());
+        return if ok { Ok(()) } else { Err(cp_diagnosed()) };
     }
-    cp_copy_file(source, target, preserve, link_map)?;
+    cp_copy_file(source, target, preserve, link_map, stderr)?;
     if preserve.mode || preserve.times {
         cp_apply_preserved(source, target, preserve.mode, preserve.times);
     }

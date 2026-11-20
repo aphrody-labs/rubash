@@ -128,7 +128,14 @@ pub(in crate::executor) fn normalize_comsub_body_statement_lines(
     let mut line = 1usize;
     // The body's first command is canonical line 1 regardless of any
     // leading blank lines in the raw text (blank lines have no node).
-    layout_command_list(&mut ast.commands, seed, &mut boundaries, &mut line, false);
+    layout_command_list(
+        &mut ast.commands,
+        seed,
+        tokens,
+        &mut boundaries,
+        &mut line,
+        false,
+    );
 }
 
 /// rubash#1184 f6 follow-up: does an extracted backquote body end with
@@ -262,6 +269,7 @@ pub(in crate::executor) fn canonical_newline_boundaries(
 fn layout_command_list(
     commands: &mut [crate::parser::CommandNode],
     seed: usize,
+    tokens: &[crate::lexer::Token],
     boundaries: &mut std::collections::HashSet<usize>,
     line: &mut usize,
     funcdef: bool,
@@ -294,7 +302,7 @@ fn layout_command_list(
             .heredoc_redirects
             .iter()
             .any(|redirect| redirect.body.is_some());
-        layout_command(command, seed, boundaries, line, funcdef);
+        layout_command(command, seed, tokens, boundaries, line, funcdef);
         // Drain every boundary inside this command's raw span: boundaries
         // that point at internal keywords (`do`, `done`, `then`, `fi`,
         // `esac`) or at continuation words (a redirect target after a
@@ -340,11 +348,17 @@ fn assign(line_field: &mut Option<usize>, seed: usize, canonical: usize) {
 fn layout_command(
     command: &mut crate::parser::CommandNode,
     seed: usize,
+    tokens: &[crate::lexer::Token],
     boundaries: &mut std::collections::HashSet<usize>,
     line: &mut usize,
     funcdef: bool,
 ) {
     let start = *line;
+    let raw_start_line = command.line;
+    let raw_span = command
+        .line
+        .zip(command.end_line)
+        .map(|(s, e)| e.saturating_sub(s));
     assign(&mut command.line, seed, start);
 
     if let Some(for_command) = command.for_command.as_deref_mut() {
@@ -358,7 +372,14 @@ fn layout_command(
             .map(|word| word.matches('\n').count())
             .sum::<usize>();
         *line = start + head_newlines + 2;
-        layout_command_list(&mut for_command.body, seed, boundaries, line, funcdef);
+        layout_command_list(
+            &mut for_command.body,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         *line += 1; // `done` at body_end + 1
         assign(&mut command.end_line, seed, *line);
         return;
@@ -370,7 +391,14 @@ fn layout_command(
             .map(|word| word.matches('\n').count())
             .sum::<usize>();
         *line = start + head_newlines + 2;
-        layout_command_list(&mut select_command.body, seed, boundaries, line, funcdef);
+        layout_command_list(
+            &mut select_command.body,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         *line += 1; // `done`
         assign(&mut command.end_line, seed, *line);
         return;
@@ -378,9 +406,23 @@ fn layout_command(
     if let Some(loop_command) = command.loop_command.as_mut() {
         // `while test; do` — `do` shares the condition's last line
         // (print_cmd.c:826 ` do\n`).
-        layout_command_list(&mut loop_command.condition, seed, boundaries, line, funcdef);
+        layout_command_list(
+            &mut loop_command.condition,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         *line += 1; // body at condition end + 1
-        layout_command_list(&mut loop_command.body, seed, boundaries, line, funcdef);
+        layout_command_list(
+            &mut loop_command.body,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         *line += 1; // `done`
         assign(&mut command.end_line, seed, *line);
         return;
@@ -388,20 +430,34 @@ fn layout_command(
     if let Some(if_command) = command.if_command.as_mut() {
         // `if test; then` — `then` shares the condition's last line
         // (print_cmd.c:850 ` then\n`).
-        layout_command_list(&mut if_command.condition, seed, boundaries, line, funcdef);
+        layout_command_list(
+            &mut if_command.condition,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         *line += 1; // then-body at condition end + 1
-        layout_command_list(&mut if_command.then_body, seed, boundaries, line, funcdef);
+        layout_command_list(
+            &mut if_command.then_body,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         for elif in &mut if_command.elif_branches {
             // An `elif` prints as a nested `else` + `if cond; then`
             // (print_cmd.c:856-864 with the false case being an if node).
             *line += 2;
-            layout_command_list(&mut elif.condition, seed, boundaries, line, funcdef);
+            layout_command_list(&mut elif.condition, seed, tokens, boundaries, line, funcdef);
             *line += 1;
-            layout_command_list(&mut elif.body, seed, boundaries, line, funcdef);
+            layout_command_list(&mut elif.body, seed, tokens, boundaries, line, funcdef);
         }
         if let Some(else_body) = &mut if_command.else_body {
             *line += 2; // `else` then body at else line + 1
-            layout_command_list(else_body, seed, boundaries, line, funcdef);
+            layout_command_list(else_body, seed, tokens, boundaries, line, funcdef);
         }
         // One `fi` per nesting level: innermost at body_end+1, one more
         // line per elif level above it (e1/e2/e6 probes).
@@ -417,7 +473,7 @@ fn layout_command(
         let mut terminator_line = patterns_line;
         for clause in &mut case_command.clauses {
             *line = patterns_line + 1; // `)\n` ends the patterns line
-            layout_command_list(&mut clause.body, seed, boundaries, line, funcdef);
+            layout_command_list(&mut clause.body, seed, tokens, boundaries, line, funcdef);
             *line += 1; // `;;` (or `;&`/`;;&`) at action end + 1
             terminator_line = *line;
             patterns_line = terminator_line + 1;
@@ -441,7 +497,14 @@ fn layout_command(
         let brace_line = start + 1;
         assign(&mut function_command.body_open_line, seed, brace_line);
         *line = brace_line + 1;
-        layout_command_list(&mut function_command.body, seed, boundaries, line, true);
+        layout_command_list(
+            &mut function_command.body,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            true,
+        );
         *line += 1; // closing `}`
         assign(&mut function_command.body_end_line, seed, *line);
         assign(&mut command.end_line, seed, *line);
@@ -455,10 +518,10 @@ fn layout_command(
         // and before the `}`).
         if funcdef {
             *line += 1; // `{` on its own line
-            layout_command_list(&mut group.body, seed, boundaries, line, funcdef);
+            layout_command_list(&mut group.body, seed, tokens, boundaries, line, funcdef);
             *line += 1; // closing `}` on its own line
         } else {
-            layout_command_list(&mut group.body, seed, boundaries, line, funcdef);
+            layout_command_list(&mut group.body, seed, tokens, boundaries, line, funcdef);
         }
         assign(&mut command.end_line, seed, *line);
         return;
@@ -467,7 +530,7 @@ fn layout_command(
         // `( ... )` keeps the body on the braces' line even inside a
         // function definition (print_cmd.c:348-355 has no funcdef branch);
         // only the body's own list separators funcdef-advance.
-        layout_command_list(&mut subshell.body, seed, boundaries, line, funcdef);
+        layout_command_list(&mut subshell.body, seed, tokens, boundaries, line, funcdef);
         assign(&mut command.end_line, seed, *line);
         return;
     }
@@ -479,7 +542,7 @@ fn layout_command(
                 .map(|word| word.matches('\n').count())
                 .sum::<usize>();
         if let Some(body) = &mut coproc.body {
-            layout_command_list(body, seed, boundaries, line, funcdef);
+            layout_command_list(body, seed, tokens, boundaries, line, funcdef);
         }
         assign(&mut command.end_line, seed, *line);
         return;
@@ -487,8 +550,12 @@ fn layout_command(
     if let Some(pipeline) = command.pipeline_command.as_mut() {
         // Stages join with ` | ` on one line (print_cmd.c:257-273).
         for stage in &mut pipeline.stages {
+            let stage_span = stage
+                .line
+                .zip(stage.end_line)
+                .map(|(s, e)| e.saturating_sub(s));
             assign(&mut stage.line, seed, *line);
-            *line += simple_command_embedded_newlines(stage);
+            *line += stage_span.unwrap_or_else(|| simple_command_embedded_newlines(stage));
         }
         assign(&mut command.end_line, seed, *line);
         return;
@@ -496,23 +563,37 @@ fn layout_command(
     if let Some(and_or) = command.and_or_list.as_mut() {
         // ` && `/` || ` join members on one line (print_cmd.c:276-286).
         for member in &mut and_or.commands {
-            layout_command(member, seed, boundaries, line, funcdef);
+            layout_command(member, seed, tokens, boundaries, line, funcdef);
         }
         assign(&mut command.end_line, seed, *line);
         return;
     }
     if let Some(background) = command.background_command.as_mut() {
-        layout_command(&mut background.command, seed, boundaries, line, funcdef);
+        layout_command(
+            &mut background.command,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         assign(&mut command.end_line, seed, *line);
         return;
     }
     if let Some(inverted) = command.inverted_command.as_mut() {
-        layout_command(&mut inverted.command, seed, boundaries, line, funcdef);
+        layout_command(
+            &mut inverted.command,
+            seed,
+            tokens,
+            boundaries,
+            line,
+            funcdef,
+        );
         assign(&mut command.end_line, seed, *line);
         return;
     }
     if let Some(timed) = command.time_command.as_mut() {
-        layout_command(&mut timed.command, seed, boundaries, line, funcdef);
+        layout_command(&mut timed.command, seed, tokens, boundaries, line, funcdef);
         assign(&mut command.end_line, seed, *line);
         return;
     }
@@ -524,7 +605,22 @@ fn layout_command(
     // body's lines and its terminator on its own line — leaving `*line` ON
     // the last terminator line; the follower's bump (layout_command_list)
     // accounts the terminator's trailing newline.
-    *line += simple_command_embedded_newlines(command);
+    let embedded = raw_span.unwrap_or_else(|| {
+        let text_newlines = simple_command_embedded_newlines(command);
+        match raw_start_line {
+            Some(rs) => {
+                let token_span = tokens
+                    .iter()
+                    .filter(|t| t.position == rs)
+                    .map(|t| t.end_position.saturating_sub(t.position))
+                    .max()
+                    .unwrap_or(0);
+                text_newlines.min(token_span)
+            }
+            None => text_newlines,
+        }
+    });
+    *line += embedded;
     let heredocs = command
         .heredoc_redirects
         .iter()
@@ -660,8 +756,25 @@ impl Executor {
         // entries (the mut typed dispatcher opens its own; the typed child
         // path below routes through this one).
         let _profiler_comsub = super::profiler::enter_comsub();
-        self.last_command_substitution_status.set(Some(0));
-        self.last_command_substitution_parse_error.set(false);
+        // rubash#3756: GNU's `$(`-body grammar failure is a READ-time
+        // error of the enclosing input (parse.y:4451 parse_comsub ->
+        // yyerror -> jump_to_top_level (DISCARD)): the command carrying
+        // it is abandoned whole, and a LATER substitution in the same
+        // word list cannot resurrect it. The entry reset below is the
+        // per-substitution bookkeeping slot (`$?` overlay, left-to-right
+        // overwrite), so it must not clear a fatal body-error latch that
+        // belongs to a non-contained (`$(`, not backtick) body — doing
+        // so let `echo $(case x in a|) $(echo ok)` run and print `ok`
+        // where GNU reports the syntax error and executes nothing.
+        // Contained bodies (backtick / arithmetic fallback, subst.c
+        // string_locale -> parse_and_execute in the child) keep their
+        // per-site reset: their error kills only the substitution.
+        let sticky_body_error = self.last_command_substitution_parse_error.get()
+            && !self.last_command_substitution_parse_error_backtick.get();
+        if !sticky_body_error {
+            self.last_command_substitution_status.set(Some(0));
+            self.last_command_substitution_parse_error.set(false);
+        }
         // A command substitution is a subshell boundary: GNU runs the body
         // in a forked child (subst.c:7143 command_substitute ->
         // execute_cmd.c:1576 execute_in_subshell), so no mutation of shell
@@ -1532,6 +1645,22 @@ impl Executor {
             self.last_command_substitution_status.set(Some(1));
             return Some(String::new());
         }
+        // rubash#3788: the fast path's probe is canonicalize + is_dir —
+        // the same pair the cd builtin used to probe with — and both
+        // succeed on a directory without the search bit, while GNU's
+        // real chdir refuses it with EACCES. The cd builtin's probe now
+        // carries the access(2) check; this arm mirrors its verdict
+        // instead of printing the logical display of a move that never
+        // happened.
+        if !crate::executor::path::directory_has_search_permission(&path) {
+            eprintln!(
+                "{}cd: {}: Permission denied",
+                self.parser_diagnostic_prefix(),
+                target_display
+            );
+            self.last_command_substitution_status.set(Some(1));
+            return Some(String::new());
+        }
 
         self.last_command_substitution_status.set(Some(0));
         // rubash#537: the physical directory renders in the same canonical
@@ -1607,7 +1736,8 @@ impl Executor {
             .and_then(|line| line.parse::<usize>().ok())
             .filter(|line| *line > 0)
             .unwrap_or(1);
-        let alias_spliced = self.comsub_body_alias_splice_extracted(source);
+        let (alias_spliced, comsub_marks, nested_comsubs) =
+            self.comsub_body_alias_splice_extracted_marked(source);
         // Newline-terminated backtick body reader — see the run_ast path
         // (issue #515). The terminator is withheld when the body ends
         // with an active backslash: it would be quoted into a line
@@ -1665,11 +1795,12 @@ impl Executor {
                 return Some(SubstitutionOutput::readback(Vec::new(), 2, context));
             }
         }
-        let tokens = crate::lexer::tokenize_comsub_body(
+        let tokens = crate::lexer::tokenize_comsub_body_marked(
             source,
             self.posix_mode_enabled(),
             body_start_line,
             true,
+            &comsub_marks,
         );
         // GNU parse.y:3105 push_heredoc: HEREDOC_MAX applies inside the
         // substitution's own parse level too (parse.y:4524 resets the
@@ -1722,6 +1853,11 @@ impl Executor {
         // executor is a clone whose session cwd field is independent, so a
         // `cd` in the body cannot move this session (or the process).
         let mut subshell = self.command_substitution_executor();
+        if !nested_comsubs.is_empty() {
+            subshell
+                .shell_state
+                .record_comsub_alias_newlines(nested_comsubs);
+        }
         // rubash#815: the comsub frame is opened by the dispatch entries
         // (expand_command_substitution_with_context / the mut typed
         // dispatcher) — every route into this child executor passes one of
@@ -1856,6 +1992,21 @@ impl Executor {
                     subshell.shell_state.env_vars.get("__RUBASH_TRAP_RESET")
                 );
             }
+            // rubash#3932: GNU runs the substitution body through
+            // parse_and_execute in the forked child, whose single plain
+            // command takes the fork-suppression mark
+            // (evalstring.c:532-536 should_suppress_fork) and exports
+            // live-1 (execute_cmd.c:5816-5817). The child's trap table
+            // was reset above (reset_for_subshell_child, trap.c
+            // reset_or_restore_signal_handlers), so a parent-set trap
+            // does not block the mark while one armed inside the body
+            // does — the seam re-checks at spawn time. Redirects block:
+            // the comsub face passes subshell==0 to should_optimize_fork
+            // (should_suppress_fork, evalstring.c:126).
+            subshell.nofork_spawn_face_allows_redirects.set(false);
+            subshell.nofork_spawn_body_candidate_pending.set(
+                super::Executor::nofork_spawn_body_tail_ok(&ast.commands, false),
+            );
             let result = if posix_mode || inherit_errexit {
                 subshell.execute_ast(&ast)
             } else {
@@ -2024,7 +2175,7 @@ impl Executor {
         // aliases at that read, so the driver's streamed-batch marker must
         // not reach the child's executor-level expansion.
         shell_state.env_vars.remove("__RUBASH_ALIAS_STREAMED");
-        let mut fd_table = self.fd_table.clone();
+        let mut fd_table = self.fd_table.saved_table();
         // GNU subst.c:7320 command_substitute: after the fork the child
         // installs the capture pipe with `dup2 (fildes[1], 1)` — fd 1
         // becomes a NEW open file description and inherits none of the
@@ -2135,6 +2286,15 @@ impl Executor {
             exec_replace_stamp_counter: Cell::new(0),
             exec_replace_stamp_hold: Cell::new(0),
             exec_replace_shlvl_snapshot: Cell::new(None),
+            nofork_spawn_dispatch_stamp: Cell::new(0),
+            nofork_spawn_stamp_counter: Cell::new(0),
+            nofork_spawn_stamp_hold: Cell::new(0),
+            nofork_spawn_body_candidate_pending: Cell::new(false),
+            nofork_spawn_body_candidate: Cell::new(false),
+            nofork_spawn_face_allows_redirects: Cell::new(false),
+            nofork_spawn_face_unconditional: Cell::new(false),
+            nofork_spawn_face_child_trap_reset: Cell::new(false),
+            respawn_payload_face: Cell::new(0),
             line_lex_locales: std::cell::RefCell::new(HashMap::new()),
             unit_lex_locale: std::cell::RefCell::new(None),
             line_lex_extquotes: std::cell::RefCell::new(HashMap::new()),
@@ -2154,6 +2314,8 @@ impl Executor {
             reap_prev_mark: Cell::new((0, None, 0)),
             execute_generation: Cell::new(0),
             foreground_wait_count: Cell::new(0),
+            disposal_wait_count: Cell::new(0),
+            disposal_prev_mark: Cell::new(0),
             coproc_stderr_forwarders: HashMap::new(),
             coproc_displaced_stdout_writers: HashMap::new(),
             assignment_output_process_substitutions: Vec::new(),
@@ -2188,6 +2350,7 @@ impl Executor {
                 .collect(),
             command_builtin_depth: self.command_builtin_depth,
             builtin_wrapper_depth: self.builtin_wrapper_depth,
+            compound_redirect_scope_depth: self.compound_redirect_scope_depth,
             standard_path_scope: self.standard_path_scope.clone(),
             // rubash#2991: the fork copy inherits the DEBUG trap's
             // in-progress state verbatim, the way GNU's fork image
@@ -2284,6 +2447,9 @@ impl Executor {
             // Executor); the parent never observes it.
             compound_redirect_failed: Cell::new(false),
             noclobber_prepared_targets: std::cell::RefCell::new(std::collections::HashSet::new()),
+            pending_preopened_redirects: std::cell::RefCell::new(std::collections::HashMap::new()),
+            preopened_pending_preserved_once: std::cell::Cell::new(false),
+            preopened_generation: std::cell::Cell::new(0),
             exit_jump_pending: Cell::new(false),
             run_diagnostics: std::cell::RefCell::new(None),
             errexit_status_converted: Cell::new(false),
@@ -2315,6 +2481,7 @@ impl Executor {
             read_sigint_guard_armed: false,
             read_eof_no_delimiter: false,
             read_process_stdin_eof: false,
+            read_delim_word_byte: None,
             read_edit_armed: false,
             read_edit_initial_text: None,
             read_edit_prompt: None,
@@ -2420,8 +2587,19 @@ impl Executor {
             .and_then(|line| line.parse::<usize>().ok())
             .filter(|line| *line > 0)
             .unwrap_or(1);
-        let tokens =
-            crate::lexer::tokenize_comsub_body(body, self.posix_mode_enabled(), start_line, true);
+        let noncounting_newlines = self
+            .shell_state
+            .comsub_alias_newlines
+            .get(body)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let tokens = crate::lexer::tokenize_comsub_body_marked(
+            body,
+            self.posix_mode_enabled(),
+            start_line,
+            true,
+            noncounting_newlines,
+        );
         // Same in-level HEREDOC_MAX fatality as the `$(` path above
         // (parse.y:3105 push_heredoc; parse.y:4524 resets the counter at
         // entry without widening the cap).
@@ -2684,6 +2862,18 @@ impl Executor {
         // high-byte name must probe as raw bytes here.
         let file_word_had_transport =
             crate::executor::markers::contains_decodable_transport(file_word);
+        // rubash#3372: the byte spelling is computed from the pre-fold
+        // word — folding first and converting afterwards
+        // (path_buf_from_folded_name) cannot tell a folded byte char
+        // from a genuine char of the same code point, so a name mixing
+        // both (genuine `é` beside a raw byte 0x9C) misspelled the
+        // genuine char as its single byte (see
+        // `transport_name_spelling_bytes`). A pure raw-byte name
+        // spelled the same either way; the mixed name is the face
+        // this changes.
+        let file_word_spelling = file_word_had_transport.then(|| {
+            crate::executor::substitution_metadata::transport_name_spelling_bytes(file_word)
+        });
         let folded_file_word =
             crate::executor::substitution_metadata::fold_literal_char_escapes(file_word);
         let file_word: &str = &folded_file_word;
@@ -2692,12 +2882,27 @@ impl Executor {
         // returns NULL with EXECUTION_SUCCESS — a directory operand is
         // silent, empty, rc 0. Windows CreateFile on a directory would
         // surface "Permission denied" instead.
-        let read_path = if file_word_had_transport {
-            crate::executor::path::path_buf_from_folded_name(
-                &shell_path_to_windows(file_word, &self.shell_state.env_vars).to_string_lossy(),
-            )
-        } else {
-            shell_path_to_windows(file_word, &self.shell_state.env_vars)
+        let read_path = match file_word_spelling {
+            Some(ref spelling) => {
+                // rubash#3372: on unix the pre-fold byte spelling IS
+                // the path (the redirect faces' transport_spelling_path
+                // rule); off unix the folded string is already the
+                // WTF-8 spelling, so the old folded route stands.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(spelling))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = spelling;
+                    crate::executor::path::path_buf_from_folded_name(
+                        &shell_path_to_windows(file_word, &self.shell_state.env_vars)
+                            .to_string_lossy(),
+                    )
+                }
+            }
+            None => shell_path_to_windows(file_word, &self.shell_state.env_vars),
         };
         // A materialized input process substitution resolves to /dev/fd/N
         // (subst.c process_substitute + move_to_high_fd): the bytes live in
@@ -2728,6 +2933,28 @@ impl Executor {
                 return bytes_to_shell_text(&content)
                     .trim_capture_terminator()
                     .to_string();
+            }
+            // rubash#3964: the enclosing context's fd 0 can ride the
+            // FUNCTION_STDIN channel instead of the fd table — a
+            // pipeline stage's input for in-process stages (brace
+            // groups, subshells), a function's stdin. The table arms
+            // above carry no endpoint for it, so the ladder fell
+            // through to the filesystem read below and read the
+            // PROCESS's own /dev/stdin (empty at ambient EOF, a
+            // block while a live ambient stdin stays open). Presence
+            // of the channel is the fd-0 binding (rubash#2111),
+            // shadowed by a virtual fd-0 endpoint (a File endpoint
+            // is served by the arm above) and never serving a
+            // closed fd 0. Serve it through the same cursor the
+            // $(cat /dev/stdin) shortcut uses, writeback included.
+            if fd == 0
+                && !self.fd_table.is_closed(0)
+                && self.virtual_fd_stdin_remaining(0).is_none()
+                && self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
+            {
+                let text = self.comsub_cat_function_stdin_text();
+                self.last_command_substitution_status.set(Some(0));
+                return text.trim_capture_terminator().to_string();
             }
         }
         // rubash#2359: there is deliberately NO net arm in this
@@ -3046,6 +3273,143 @@ pub(in crate::executor) fn extract_funsub_body(
     extract_funsub_body_tail(chars).map(|body| (body, valsub))
 }
 
+/// Consume a `<<` heredoc (header + body lines) from a funsub-body char
+/// stream, pushing it verbatim into `body`. The caller has consumed both
+/// `<` and verified there is no third (`<<<` is a herestring). Heredoc
+/// bodies are raw lines (make_cmd.c:512): a `}` or a quote character
+/// inside them must not move the extent scan, so the whole heredoc is
+/// copied opaque (rubash#3823 h2/h3). The delimiter word is dequoted for
+/// the line comparison — quoting inside it makes metacharacters literal
+/// (a quoted `)` is delimiter text, not a closer). An empty delimiter
+/// copies nothing further (the `<<` was not a heredoc after all).
+/// Shared with the mut walker's funsub collector
+/// (`expand_current_shell_braced_substitution`, embedded_mutations.rs).
+pub(in crate::executor) fn push_funsub_heredoc(
+    chars: &mut std::iter::Peekable<impl Iterator<Item = char>>,
+    body: &mut String,
+) {
+    let mut strip_tabs = false;
+    if chars.peek() == Some(&'-') {
+        chars.next();
+        body.push('-');
+        strip_tabs = true;
+    }
+    while chars.peek().is_some_and(|&c| matches!(c, ' ' | '\t')) {
+        if let Some(c) = chars.next() {
+            body.push(c);
+        }
+    }
+    // Delimiter word: quoting makes metacharacters literal; a backslash
+    // quotes the next byte. The word ends at whitespace or `;` `|` `&`
+    // `)`, mirroring the lexer's heredoc header scan.
+    let mut raw_delim = String::new();
+    let mut d_single = false;
+    let mut d_double = false;
+    while let Some(&c) = chars.peek() {
+        if d_single {
+            if c == '\'' {
+                d_single = false;
+            }
+            raw_delim.push(c);
+            body.push(c);
+            chars.next();
+            continue;
+        }
+        if d_double {
+            if c == '"' {
+                d_double = false;
+            } else if c == '\\' {
+                raw_delim.push(c);
+                body.push(c);
+                chars.next();
+                if let Some(e) = chars.next() {
+                    raw_delim.push(e);
+                    body.push(e);
+                }
+                continue;
+            }
+            raw_delim.push(c);
+            body.push(c);
+            chars.next();
+            continue;
+        }
+        match c {
+            '\'' => {
+                d_single = true;
+                raw_delim.push(c);
+                body.push(c);
+                chars.next();
+            }
+            '"' => {
+                d_double = true;
+                raw_delim.push(c);
+                body.push(c);
+                chars.next();
+            }
+            '\\' => {
+                raw_delim.push(c);
+                body.push(c);
+                chars.next();
+                if let Some(e) = chars.next() {
+                    raw_delim.push(e);
+                    body.push(e);
+                }
+            }
+            _ if c.is_whitespace() || matches!(c, ';' | '|' | '&' | ')') => break,
+            _ => {
+                raw_delim.push(c);
+                body.push(c);
+                chars.next();
+            }
+        }
+    }
+    let mut delimiter = crate::lexer::dequote_heredoc_delimiter(&raw_delim);
+    if strip_tabs {
+        delimiter = delimiter.trim_start_matches('\t').to_string();
+    }
+    if delimiter.is_empty() {
+        return;
+    }
+    // Header rest (to EOL), then the newline.
+    while chars.peek().is_some_and(|&c| c != '\n') {
+        if let Some(c) = chars.next() {
+            body.push(c);
+        }
+    }
+    if chars.peek() == Some(&'\n') {
+        chars.next();
+        body.push('\n');
+    }
+    // Body lines, verbatim, until the delimiter line (or EOF).
+    loop {
+        let mut line = String::new();
+        while chars.peek().is_some_and(|&c| c != '\n') {
+            if let Some(c) = chars.next() {
+                line.push(c);
+            }
+        }
+        let comparable = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        body.push_str(&line);
+        if comparable == delimiter {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+                body.push('\n');
+            }
+            break;
+        }
+        if chars.peek() == Some(&'\n') {
+            chars.next();
+            body.push('\n');
+        } else {
+            break; // EOF without the delimiter line.
+        }
+    }
+}
+
 /// The body scan of `extract_funsub_body` with the introducer already
 /// consumed: the iterator sits at the first body character (the blank after
 /// `${' or the first byte after `${|'). Consumes through the terminating
@@ -3064,10 +3428,21 @@ fn extract_funsub_body_tail(
     // (`;` `&` `|` newline) or a closed `{ }` group / `( )` subshell — the
     // same term model continuation.rs's funsub delimiter carries.
     let mut term = true;
+    // Shell_getc token-boundary state for `#` comment recognition
+    // (parse.y:3631-3645): true at the body start and after a blank,
+    // newline, or operator (`;` `&` `|` `(` `)` `<` `>`); false inside
+    // a word. `term` above answers a different question (is `}` a group
+    // closer here) — after `echo hi ` it is false while a `#` still
+    // comments — so the comment arm needs its own state (same split as
+    // skip_funsub_body's `at_word_start`, #3813). Without it an
+    // apostrophe inside a comment (`# don't`) opened a phantom
+    // single-quote that swallowed the rest of the input (rubash#3823 f1).
+    let mut at_word_start = true;
     while let Some(ch) = chars.next() {
         if escaped {
             body.push(ch);
             escaped = false;
+            at_word_start = false;
             continue;
         }
         if ch == '\\' && !single {
@@ -3076,6 +3451,7 @@ fn extract_funsub_body_tail(
             if !double {
                 term = false;
             }
+            at_word_start = false;
             continue;
         }
         if single {
@@ -3092,6 +3468,22 @@ fn extract_funsub_body_tail(
             body.push(ch);
             continue;
         }
+        // parse.y:3631 shell_getc: `#` at a token start discards to EOL;
+        // a quote character inside the comment is inert. The comment is
+        // pushed verbatim into the body (the re-parse below is the real
+        // parser, which recognizes it); only the extent scan must not
+        // quote-track through it. The newline itself is left for the next
+        // iteration (the `;`/`&`/`|`/`\n` arm), which restores command
+        // position.
+        if ch == '#' && at_word_start {
+            body.push(ch);
+            while chars.peek().is_some_and(|&next| next != '\n') {
+                if let Some(c) = chars.next() {
+                    body.push(c);
+                }
+            }
+            continue;
+        }
         let mut word_text = false;
         match ch {
             '$' => {
@@ -3103,24 +3495,35 @@ fn extract_funsub_body_tail(
                 body.push(ch);
                 consume_nested_dollar_unit(chars, &mut body);
                 term = false;
+                at_word_start = false;
                 continue;
             }
             '\'' => {
                 single = true;
                 term = false;
+                at_word_start = false;
             }
             '"' => {
                 double = true;
                 term = false;
+                at_word_start = false;
             }
             '(' => {
                 paren_depth += 1;
                 term = false;
+                at_word_start = true;
             }
             ')' if paren_depth > 0 => {
                 paren_depth -= 1;
                 // A closed outermost `( )` is a complete command.
                 term = paren_depth == 0;
+                at_word_start = true;
+            }
+            // A bare `)` (no open subshell) is a metacharacter, not word
+            // text: the next token starts after it.
+            ')' => {
+                term = false;
+                at_word_start = true;
             }
             '{' if term && paren_depth == 0 => {
                 brace_depth += 1;
@@ -3139,16 +3542,68 @@ fn extract_funsub_body_tail(
                     // separator (`${ { echo x; } }`).
                     brace_depth -= 1;
                     term = true;
+                    at_word_start = true;
                 } else {
                     return Some(body);
                 }
             }
-            ';' | '&' | '|' | '\n' if paren_depth == 0 => term = true,
-            ' ' | '\t' | '\r' => {}
+            // Heredoc bodies are raw lines (make_cmd.c:512): a `}` or a
+            // quote character inside the body must not move this scan
+            // (rubash#3823 h2/h3). A second `<` starts the heredoc (the
+            // helper copies the header and body lines verbatim); a third
+            // `<` makes `<<<`, a herestring with no body to skip, and
+            // stays for the next iteration's plain `<` arm.
+            '<' if chars.peek() == Some(&'<') => {
+                body.push(ch);
+                if let Some(second) = chars.next() {
+                    body.push(second);
+                }
+                if chars.peek() == Some(&'<') {
+                    // `<<<` herestring: mid-operator, not a token start.
+                    at_word_start = false;
+                    term = false;
+                    continue;
+                }
+                push_funsub_heredoc(chars, &mut body);
+                // A heredoc terminator ends on its own line, so the next
+                // character begins a fresh token — and, at funsub level,
+                // a `}` there is the body's closer. `term` stays false
+                // inside a subshell (an inner group's `}` must not read
+                // as this funsub's closer), mirroring skip_funsub_body
+                // (#3813).
+                at_word_start = true;
+                if paren_depth == 0 {
+                    term = true;
+                }
+                continue;
+            }
+            // A redirection operator ends the previous word: the target
+            // word starts here, so a `#` there comments (parse.y:3631;
+            // `echo >#f` is a comment in GNU, #2033). `term` is
+            // untouched — a `}` right after `>` is the redirect's target
+            // word, not this body's closer.
+            '<' | '>' => {
+                term = false;
+                at_word_start = true;
+            }
+            ';' | '&' | '|' | '\n' => {
+                // `term` stays false inside a subshell (an inner group's
+                // `}` must not read as this funsub's closer), but the
+                // token boundary is real at any depth: `#` after `;`
+                // comments even inside `( ... )`.
+                if paren_depth == 0 {
+                    term = true;
+                }
+                at_word_start = true;
+            }
+            ' ' | '\t' | '\r' => {
+                at_word_start = true;
+            }
             _ => word_text = true,
         }
         if word_text {
             term = false;
+            at_word_start = false;
         }
         body.push(ch);
     }
@@ -3269,6 +3724,16 @@ impl Executor {
     /// parse-error latch keeps the driver's own reporting stood down,
     /// so the execution screen never double-reports if the unit is
     /// reached anyway. Returns the abort status on a hit.
+    /// rubash#3306: whether the freshly parsed unit already carries a
+    /// hard command-substitution body error — the read-time verdict
+    /// GNU's parse_comsub reaches at the `)` that closed the
+    /// substitution (parse.y:4549-4555). The unclosed-input router and
+    /// the interactive pending check consult this so a doomed body
+    /// reports through the screen instead of the generic EOF route.
+    pub fn comsub_body_error_pending(&self, commands: &[CommandNode]) -> bool {
+        read_time_body_error(commands, 0).is_some()
+    }
+
     pub fn screen_comsub_bodies_at_read(&mut self, commands: &[CommandNode]) -> Option<i32> {
         let (command, body_text) = read_time_body_error(commands, 0)?;
         self.report_comsub_body_parse_error(&command, Some(&body_text));

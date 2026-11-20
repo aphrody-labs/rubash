@@ -15,6 +15,18 @@ pub(in crate::executor) fn cat_closed_stdout_error() -> ExecuteError {
 }
 
 impl Executor {
+    /// rubash#3875: the retained preflight walk (the rubash#3828
+    /// probe channel) may already hold this entry's one open -
+    /// adopt it instead of re-opening the mirror target by path
+    /// (the cat emulation's writers are the bind for its fd 1
+    /// mirror; GNU opens the entry once, redir.c:237).
+    fn take_parked_output_mirror(&mut self, cmd: &CommandNode, target: &str) -> Option<File> {
+        let position = self.output_entry_position(cmd, 1, target);
+        let file_fd = self.take_pending_preopened(position, target)?;
+        let dup = crate::fd::duplicate_handle(file_fd.handle).ok()?;
+        Some(crate::fd::handle_to_file(dup))
+    }
+
     pub(in crate::executor) fn write_cat_output(
         &mut self,
         cmd: &CommandNode,
@@ -79,8 +91,12 @@ impl Executor {
             {
                 return result;
             }
-            let file =
-                self.create_redirect_output_for(Some(redirect), &target, redirect.clobber)?;
+            let file = match self.take_parked_output_mirror(cmd, &target) {
+                Some(file) => file,
+                None => {
+                    self.create_redirect_output_for(Some(redirect), &target, redirect.clobber)?
+                }
+            };
             crate::fd::write_file_all(&file, output)?;
         } else if let Some(redirect) = &cmd.append {
             let target = self.expand_redirect_target(redirect);
@@ -103,7 +119,14 @@ impl Executor {
             // Classified append open (rubash#1964): the raw mapped
             // open this replaces could not reach /dev/tcp targets
             // (their mapped name is not a file).
-            let file = self.open_append_target(&target)?;
+            // rubash#3372: the node form (see open_cat_output_sink
+            // above) — the create arm in this same function already
+            // takes it, and the append arm's string record is the
+            // same collision.
+            let file = match self.take_parked_output_mirror(cmd, &target) {
+                Some(file) => file,
+                None => self.open_append_target_for(Some(redirect), &target)?,
+            };
             crate::fd::write_file_all(&file, output)?;
         } else {
             self.write_default_stdout(output)?;
@@ -123,13 +146,24 @@ impl Executor {
         &mut self,
         cmd: &CommandNode,
     ) -> Result<Option<File>, ExecuteError> {
-        let (target, clobber, append) = match (&cmd.redirect_out, &cmd.append) {
+        // rubash#3372: keep the node alongside the expanded target —
+        // the sink's opens below resolve the node's own recorded
+        // spelling, never the folded-string record (a sibling
+        // `2>"$a"` expansion would otherwise steer this `>"$b"` /
+        // `>>"$b"` open onto the raw-byte file).
+        let (target, clobber, append, redirect) = match (&cmd.redirect_out, &cmd.append) {
             (Some(redirect), _) => (
                 self.expand_redirect_target(redirect),
                 redirect.clobber,
                 false,
+                Some(&**redirect),
             ),
-            (None, Some(append)) => (self.expand_redirect_target(append), true, true),
+            (None, Some(append)) => (
+                self.expand_redirect_target(append),
+                true,
+                true,
+                Some(&**append),
+            ),
             (None, None) => return Ok(None),
         };
         if crate::executor::execution_misc::is_closed_redirect_target(&target) {
@@ -140,12 +174,17 @@ impl Executor {
         if crate::executor::execution_misc::redirect_target_fd(&target).is_some() {
             return Ok(None);
         }
+        if let Some(file) = self.take_parked_output_mirror(cmd, &target) {
+            return Ok(Some(file));
+        }
         if append {
             // Classified append open (rubash#1964), the streaming
             // twin of write_cat_output's append arm.
-            return Ok(Some(self.open_append_target(&target)?));
+            return Ok(Some(self.open_append_target_for(redirect, &target)?));
         }
-        Ok(Some(self.create_redirect_output(&target, clobber)?))
+        Ok(Some(
+            self.create_redirect_output_for(redirect, &target, clobber)?,
+        ))
     }
 
     pub(in crate::executor) fn finish_external_error(
@@ -663,8 +702,12 @@ impl Executor {
             // is the adoption the initializer just performed against
             // its inherited $PWD (rubash#2799).
             self.shell_state.logical_cwd = Some(child_logical_cwd);
+            // rubash#3108: same provenance rule as Executor::new —
+            // the child table was just re-seeded by
+            // initialize_fresh_shell_env_vars, so bind exported from
+            // the table's attributes, not blanket-true.
             self.shell_state.variables =
-                crate::shell::VariableStore::from_environment(&self.shell_state.env_vars);
+                crate::shell::VariableStore::from_var_table(&self.shell_state.env_vars);
             // GNU variables.c:511-526 (initialize_shell_variables): a fresh
             // shell invocation inherits only exported variables and exported
             // functions (via BASH_FUNC_<name>%% env vars). Non-exported
@@ -843,7 +886,7 @@ impl Executor {
         // the file_stdin install below: GNU applies `< file` in the CHILD
         // (do_redirections after fork), so the parent's fd 0 slot is the
         // pre-redirect state — restoring it also unwinds our emulation.
-        let saved_fd_table = self.fd_table.clone();
+        let saved_fd_table = self.fd_table.saved_table();
         // GNU execute_cmd.c redirects before the child runs: `< file` puts
         // the open file on the child's fd 0, so `exec 3<&0` inside the child
         // dups the file (shared offset). Install a real File endpoint on

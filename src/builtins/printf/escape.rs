@@ -307,7 +307,21 @@ fn unicode_escape_text(codepoint: u32) -> String {
     // rubash#2979: u32cconv converts in the shell's CURRENT locale —
     // ask the active (guard) locale, not the process environment.
     if codepoint <= 0x7F || crate::locale::is_multi_byte_active() {
-        return crate::executor::substitution_metadata::u32cconv_utf8_text(codepoint);
+        let text = crate::executor::substitution_metadata::u32cconv_utf8_text(codepoint);
+        // rubash#3921 (D2): a genuine scalar in the marker zone
+        // (U+E000..=U+E401) returns as a lone char, and the printf
+        // output path runs `raw_bytes` (shell_text_to_raw_bytes) over
+        // the segment — a lone U+E000 + payload pair folds to a NUL
+        // byte. E400-escape a single-char result so raw_bytes restores
+        // the char; multi-char results are raw-byte marker pairs (the
+        // 5/6-byte forms, the control-carrier arm) and already are
+        // transport, so they pass through untouched. Never touch
+        // u32cconv_utf8_text itself — IFS needs the bare char there
+        // (glob2.sub uses IFS=$'\u3b1').
+        if text.chars().count() == 1 {
+            return crate::executor::substitution_metadata::escape_marker_zone_chars(&text);
+        }
+        return text;
     }
     // Emit the escape literally: backslash + u/U + canonical hex. The
     // backslash is built from its code point so the format strings below stay
@@ -354,6 +368,27 @@ pub(super) fn shell_quote(value: &str) -> String {
     shell_quote_form(value, false)
 }
 
+/// The glibc `iswprint` verdict under a UTF-8 locale (LC_ALL=C.utf8,
+/// measured with a probe program against the locale's actual print
+/// class): a C1 control (U+0080..=U+009F) is NOT printable, and neither
+/// are the line/paragraph separators U+2028/U+2029, while format
+/// characters (U+200B, U+00AD, U+FEFF), spaces (U+00A0, U+3000), PUA
+/// and every normal graphic character ARE. Rust's `char::is_control()`
+/// covers the C0+C1 Cc category; the two separator codepoints are the
+/// glibc residual this model adds. Codepoints unassigned in the Unicode
+/// allocation (U+0378, U+D7FF, U+10FFFF in the probe) are also
+/// non-printing to glibc; this model treats them as printable — a
+/// documented residual confined to unassigned codepoints, which no
+/// assigned character's rendering depends on.
+fn ansic_char_printable(ch: char, utf8_locale: bool) -> bool {
+    if !ch.is_ascii() && !utf8_locale {
+        // Under a non-UTF-8 locale every byte >= 0x80 is non-printing
+        // (rubash#1464).
+        return false;
+    }
+    !ch.is_control() && ch != '\u{2028}' && ch != '\u{2029}'
+}
+
 /// GNU printf.def:695-702 quoting decision for %q/%Q: empty -> `''`;
 /// ansic_shouldquote (control characters / non-printable bytes) ->
 /// ansic_quote ($'...'); altform (`%#q') -> sh_single_quote; otherwise
@@ -384,8 +419,14 @@ pub(super) fn shell_quote_form(value: &str, altform: bool) -> String {
     // >= 0x80 is non-printing, so a value like café takes the $'...'
     // form with per-byte octal escapes under LC_ALL=C even though it
     // contains no control characters (rubash#1464).
-    if value.chars().any(|ch| ch.is_control())
-        || (!crate::locale::is_multi_byte_active() && value.chars().any(|ch| !ch.is_ascii()))
+    // rubash#3942: under a UTF-8 locale the print class is glibc's
+    // iswprint (strtrans.c ansic_wshouldquote mbstowcs + iswprint walk),
+    // so a C1 control or U+2028 in the value forces the $'...' form the
+    // same way a C0 control does.
+    let utf8_locale = crate::locale::is_multi_byte_active();
+    if value
+        .chars()
+        .any(|ch| !ansic_char_printable(ch, utf8_locale))
     {
         return ansi_c_shell_quote(value);
     }
@@ -528,6 +569,17 @@ fn push_ansic_escaped_chars(quoted: &mut String, chars: impl Iterator<Item = cha
                     quoted.push_str(&format!("\\{byte:03o}"));
                 }
             }
+            // rubash#3942: a VALID multibyte character is copied verbatim
+            // only when it is printable (strtrans.c ansic_quote's
+            // iswprint branch) — a non-printing one (C1 controls,
+            // U+2028/U+2029) falls through to the octal escape of each of
+            // its bytes, exactly like the invalid-byte path.
+            ch if !ch.is_ascii() && !ansic_char_printable(ch, utf8) => {
+                let mut buffer = [0u8; 4];
+                for byte in ch.encode_utf8(&mut buffer).as_bytes() {
+                    quoted.push_str(&format!("\\{byte:03o}"));
+                }
+            }
             ch => quoted.push(ch),
         }
     }
@@ -554,6 +606,14 @@ fn ansi_c_shell_quote(value: &str) -> String {
             // Same non-UTF-8-locale per-byte rule as
             // push_ansic_escaped_chars (rubash#1464).
             ch if !ch.is_ascii() && !utf8 => {
+                let mut buffer = [0u8; 4];
+                for byte in ch.encode_utf8(&mut buffer).as_bytes() {
+                    quoted.push_str(&format!("\\{byte:03o}"));
+                }
+            }
+            // rubash#3942: same iswprint rule as push_ansic_escaped_chars
+            // — a non-printing multibyte character escapes per byte.
+            ch if !ch.is_ascii() && !ansic_char_printable(ch, utf8) => {
                 let mut buffer = [0u8; 4];
                 for byte in ch.encode_utf8(&mut buffer).as_bytes() {
                     quoted.push_str(&format!("\\{byte:03o}"));

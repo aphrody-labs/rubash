@@ -200,6 +200,12 @@ pub(crate) fn replace_process_image(
         clean_env,
         effective_argv0.as_deref(),
         cwd,
+        setup.cwd_stamp(),
+        // rubash#3310: the true-replacement path never runs inside a
+        // subshell — exec_image_replacement_applies (trap_exec.rs)
+        // requires subshell_depth == 0 — so the SUBSHELL_PAREN skip
+        // GNU's exec.def:200 applies is unreachable here.
+        false,
     );
     // rubash#3311: the image inherits the shell's descriptor table as
     // do_redirections left it (exec.def:231 shell_execve) — the fd >= 3
@@ -227,6 +233,11 @@ pub(crate) fn replace_process_image(
         use std::os::unix::process::CommandExt;
         process.pre_exec(crate::builtins::kill::child_pre_exec_reset);
     }
+    // rubash#3219: an exec issued inside an in-process fork region
+    // hands the new image the region's recorded ulimit pairs — GNU's
+    // subshell fork already carries them in the process itself (see
+    // builtins/ulimit.rs emulated_limit_pairs). No-op outside regions.
+    crate::builtins::ulimit::arm_emulated_limits(&mut process, env_vars);
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
     let error = {
@@ -432,8 +443,17 @@ where
     };
 
     if command == Some("printenv") {
-        return run_printenv_fallback(operands, env_vars, clean_env, stdout)
-            .map_err(ExecuteError::from);
+        return run_printenv_fallback(
+            operands,
+            env_vars,
+            clean_env,
+            // rubash#3310: the emulation reports the exec'd image's
+            // environment, so it takes the same SUBSHELL_PAREN skip
+            // as the spawn path (see in_subshell_paren).
+            in_subshell_paren(executor.as_deref()),
+            stdout,
+        )
+        .map_err(ExecuteError::from);
     }
 
     if let Some(command) = command {
@@ -454,16 +474,27 @@ where
             // (EX_NOEXEC), not "not found" (rubash#2661). The probe
             // anchors at the session cwd (G-02), like the slash branch
             // below.
-            let as_written = crate::executor::path::shell_path_to_windows(command, env_vars);
-            let as_written = if as_written.is_absolute() {
-                as_written
-            } else {
-                cwd.join(&as_written)
+            // GNU builtins/exec.def:155-168 + general.c:812-817:
+            // file_isdir (args[0]) is `stat (fn) == 0 && S_ISDIR`,
+            // and `stat ("")` fails ENOENT — the empty word is not a
+            // directory, it is "not found" (127). The session-cwd join
+            // below must not manufacture one: `cwd.join ("")` IS the
+            // cwd, so an unguarded probe reads the empty word as the
+            // cwd directory and misclassifies it as EX_NOEXEC (126)
+            // (rubash#3317). Non-empty words keep the #2661 probe
+            // unchanged (`exec .`, `exec somedir` stay 126).
+            let is_dir = !command.is_empty() && {
+                let as_written = crate::executor::path::shell_path_to_windows(command, env_vars);
+                let as_written = if as_written.is_absolute() {
+                    as_written
+                } else {
+                    cwd.join(&as_written)
+                };
+                std::fs::metadata(&as_written)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
             };
-            if std::fs::metadata(&as_written)
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(false)
-            {
+            if is_dir {
                 writeln!(
                     stderr,
                     "{}exec: {command}: cannot execute: Is a directory",
@@ -497,14 +528,16 @@ where
                         // exec.def:166-168 full_pathname: the failing path is
                         // reported resolved against the current directory
                         // (the session cwd, G-02).
+                        // rubash#3316: the same full_pathname rebinding
+                        // as every other exec report (one leading `./`
+                        // removed, nothing else canonicalized).
                         let full = if command.starts_with('/')
                             || command.starts_with('\\')
                             || command.as_bytes().get(1) == Some(&b':')
                         {
                             command.to_string()
                         } else {
-                            format!("{}/{}", cwd.to_string_lossy().replace('\\', "/"), command)
-                                .replace("/./", "/")
+                            full_pathname(command, cwd)
                         };
                         // A regular file as a path component fails the
                         // probe ENOTDIR; GNU's file_error classification
@@ -725,52 +758,84 @@ where
     Ok(Some(index))
 }
 
+/// The exec target word before absolutization: exec.def:151 hands
+/// full_pathname `command`, which is the typed word itself for a
+/// slash-bearing name (absolute_program; findcmd.c:385-387 never
+/// searches it) and the search's as-written `<elem>/<name>` join
+/// otherwise (findcmd.c find_in_path_element's sh_makepath) — the
+/// shared spawn funnel's name (`path::spawn_exec_name`). A resolution
+/// the walk did not itself produce (a hash-table hit, or any non-unix
+/// lookup, whose recorded form is the resolved path) keeps the
+/// resolved program's rendering. Folded like every other probe and
+/// diagnostic in this file (rubash#3076): the word names the raw file.
+fn exec_target_word(
+    command_name: &str,
+    program: &std::path::Path,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> String {
+    let folded = crate::executor::substitution_metadata::fold_literal_char_escapes(command_name);
+    crate::executor::path::spawn_exec_name(&folded, program, env_vars)
+        .or_else(|| crate::executor::path::has_path_separator(&folded).then(|| folded.clone()))
+        .unwrap_or_else(|| program.to_string_lossy().into_owned())
+}
+
+/// GNU general.c:931-943 full_pathname, the exec builtin's rebinding
+/// of its target (exec.def:172 `com2 = full_pathname (command)`): an
+/// absolute word is returned verbatim (general.c:937-938); anything
+/// else is `sh_makepath (NULL, file, MP_DOCWD|MP_RMDOT)`
+/// (lib/sh/makepath.c) — the current working directory, one `/`
+/// unless the directory already ends in one, then the word with ONE
+/// leading `./` removed (MP_RMDOT strips exactly `dir[0] == '.' &&
+/// dir[1] == '/'`). Nothing else is canonicalized: `././s`, `a/./s`,
+/// `a/../s` and `.//s` keep their remaining components (rubash#3316;
+/// GNU 5.3.20 probe: `exec ././s.sh` -> $0 `$PWD/./s.sh`,
+/// `exec sub/../s.sh` -> `$PWD/sub/../s.sh`). The result is both the
+/// execve filename — so the kernel hands it to a `#!` interpreter as
+/// the script name — and the name shell_execve's failure reports
+/// carry (file_error / sys_error on `command`).
+fn full_pathname(word: &str, cwd: &std::path::Path) -> String {
+    // The `\` fold and the `X:/` drive test are Win32-host path syntax,
+    // not GNU semantics: general.h's ABSPATH arm is `x[0]=='/'` only
+    // (the `!defined(__CYGWIN__)` side carries no drive notion either),
+    // and on Unix `\` is an ordinary filename byte while `D:/x` is a
+    // relative path. Gate both to Windows so a Unix execve sees the
+    // word's original bytes.
+    let word = if cfg!(windows) {
+        word.replace('\\', "/")
+    } else {
+        word.to_owned()
+    };
+    let bytes = word.as_bytes();
+    let absolute = word.starts_with('/')
+        || (cfg!(windows) && bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/');
+    if absolute {
+        return word;
+    }
+    // G-02: general.c's "current working directory" is the session cwd.
+    let cwd = if cfg!(windows) {
+        cwd.to_string_lossy().replace('\\', "/")
+    } else {
+        cwd.to_string_lossy().into_owned()
+    };
+    let rest = word.strip_prefix("./").unwrap_or(&word);
+    if cwd.ends_with('/') {
+        format!("{cwd}{rest}")
+    } else {
+        format!("{cwd}/{rest}")
+    }
+}
+
 /// The reported name for a failed spawn on the exec face: GNU
-/// builtins/exec.def:172 hands shell_execve `full_pathname (command)`
-/// (general.c:931-943) — the typed word for a slash-bearing name
-/// (findcmd.c:385-387 savestring), the PATH walk's as-written join
-/// otherwise — made absolute against the cwd with dot components
-/// removed (sh_makepath, MP_DOCWD|MP_RMDOT). The resolved `program`
-/// cannot be re-rendered into this form: the session-cwd anchor that
-/// produced it keeps the join's `/./` residue (rubash#3148).
+/// builtins/exec.def:172 hands shell_execve `full_pathname (command)`,
+/// and shell_execve reports every refusal against that string
+/// (rubash#3148, rubash#3316).
 fn exec_report_name(
     command_name: &str,
     program: &std::path::Path,
     env_vars: &crate::shell::var_table::VarTable,
     cwd: &std::path::Path,
 ) -> String {
-    // Folded like every other probe and diagnostic in this file
-    // (rubash#3076): the recorded join names the raw file.
-    let folded = crate::executor::substitution_metadata::fold_literal_char_escapes(command_name);
-    let construction = if crate::executor::path::has_path_separator(&folded) {
-        folded
-    } else {
-        crate::executor::path::find_user_command_as_written(&folded, env_vars)
-            .unwrap_or_else(|| program.display().to_string())
-    };
-    let construction = construction.replace('\\', "/");
-    // full_pathname: an absolute construction is returned verbatim
-    // (general.c:937-938).
-    if construction.starts_with('/') || construction.as_bytes().get(1) == Some(&b':') {
-        return construction;
-    }
-    let cwd = cwd.to_string_lossy().replace('\\', "/");
-    let joined = format!("{cwd}/{construction}");
-    // sh_makepath MP_RMDOT canonicalizes the joined form textually:
-    // "." components drop, ".." consumes the preceding component,
-    // empty components collapse.
-    let root_prefix = if joined.starts_with('/') { "/" } else { "" };
-    let mut parts: Vec<&str> = Vec::new();
-    for part in joined.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
-        }
-    }
-    format!("{root_prefix}{}", parts.join("/"))
+    full_pathname(&exec_target_word(command_name, program, env_vars), cwd)
 }
 
 /// GNU shell_execve (execute_cmd.c:6126-6198) reporting for a failed
@@ -821,6 +886,8 @@ where
     W: Write,
     E: Write,
 {
+    // rubash#3310: the SUBSHELL_PAREN latch (see in_subshell_paren).
+    let in_subshell_paren = in_subshell_paren(executor.as_deref());
     let mut process = external_exec_process(
         program,
         command_name,
@@ -829,6 +896,8 @@ where
         clean_env,
         argv0,
         cwd,
+        setup.cwd_stamp(),
+        in_subshell_paren,
     );
     setup.apply(&mut process);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -915,6 +984,10 @@ fn run_external_exec_with_stdio<E>(
 where
     E: Write,
 {
+    // rubash#3310: same SUBSHELL_PAREN latch as run_external_exec
+    // above (see in_subshell_paren for the mapping and the
+    // pipeline-element gap).
+    let in_subshell_paren = in_subshell_paren(executor.as_deref());
     let mut process = external_exec_process(
         program,
         command_name,
@@ -923,6 +996,8 @@ where
         clean_env,
         argv0,
         cwd,
+        setup.cwd_stamp(),
+        in_subshell_paren,
     );
     setup.apply(&mut process);
     process.stdout(child_stdout).stderr(child_stderr);
@@ -977,6 +1052,25 @@ where
     Ok(crate::executor::wait_status::process_exit_status(&status))
 }
 
+/// rubash#3310: whether the exec builtin runs inside a `( )`
+/// subshell — GNU builtins/exec.def:200 skips the SHLVL decrement
+/// there (SUBSHELL_PAREN). Rubash carries no SUBSHELL_PAREN bit;
+/// the latch set at every `( )` region entry (ast_exec flat region,
+/// compound_exec scoped subshell, the comsub body's stripped `( )`
+/// group) is subshell_login_cleared — a plain `$( )` body leaves it
+/// clear, and a respawned child (background `&`, procsub) starts
+/// from a fresh executor with it clear, so the latch tracks the
+/// paren boundary for the shapes the builtin can observe. Known gap:
+/// a pipeline element also sets the latch (pipeline_exec.rs), while
+/// GNU decrements there (SUBSHELL_FORK/SUBSHELL_PIPE, no PAREN) —
+/// that face is left for a follow-up with a real stage marker, not
+/// an fd-shape heuristic.
+fn in_subshell_paren(executor: Option<&crate::executor::Executor>) -> bool {
+    executor
+        .map(|exec| exec.shell_state.subshell_login_cleared.get())
+        .unwrap_or(false)
+}
+
 fn external_exec_process(
     program: &std::path::Path,
     command_name: &str,
@@ -985,6 +1079,8 @@ fn external_exec_process(
     clean_env: bool,
     argv0: Option<&str>,
     cwd: &std::path::Path,
+    cwd_stamp: crate::executor::ChildCwdStamp,
+    in_subshell_paren: bool,
 ) -> Command {
     // GNU builtins/exec.def (exec_builtin): `com2 = full_pathname (command)`
     // rebinds the exec target to its absolute path before shell_execve, so
@@ -993,14 +1089,19 @@ fn external_exec_process(
     // script name). Non-script targets keep the dispatcher word form.
     // rubash#3415: a resolvable non-shell `#!` interpreter is spawned
     // directly (GNU execute_shell_script, execute_cmd.c:6001-6043) before
-    // the shell wrap below can run the script as bash.
-    let zero_word = full_pathname_word(program, cwd);
-    let mut process = if let Some((command, _)) =
-        crate::executor::path::shebang_interpreter_command(program, &zero_word, operands, env_vars)
-    {
+    // the shell wrap below can run the script as bash. Both wraps — and
+    // the execve filename below — take the same com2 string: the target
+    // word rebound by full_pathname (exec.def:172).
+    let exec_filename = full_pathname(&exec_target_word(command_name, program, env_vars), cwd);
+    let mut process = if let Some((command, _)) = crate::executor::path::shebang_interpreter_command(
+        program,
+        &exec_filename,
+        operands,
+        env_vars,
+    ) {
         command
     } else if let Some((command, _)) =
-        crate::executor::path::shell_wrapped_command(program, &zero_word, operands, env_vars)
+        crate::executor::path::shell_wrapped_command(program, &exec_filename, operands, env_vars)
     {
         command
     } else {
@@ -1008,14 +1109,13 @@ fn external_exec_process(
         // (shell_execve via external_command_for_named_program), NOT the
         // resolved program's file stem: `exec /usr/bin/bash -c 'echo $0'`
         // reports /usr/bin/bash in GNU (rubash#1227).
-        // rubash#2442 audit: this route deliberately stays OFF the
-        // spawn_exec_name funnel — GNU's exec builtin absolutizes the
-        // resolved target before shell_execve (exec.def:172
-        // full_pathname, exec.def:231), so the execve filename here
-        // is the anchored program, and a script run through `exec`
-        // reports the absolute path as its $0 where every other
-        // spawn shape reports the as-written join.
-        let (command, _) = crate::executor::path::external_command_for_named_program(
+        // rubash#2442/#3316: the execve filename is the funnel's
+        // word (exec_target_word) rebound by full_pathname
+        // (exec.def:172, handed to shell_execve at exec.def:231) — not
+        // the session-anchored program, whose cwd join keeps a `./`
+        // the GNU rebinding strips — so a `#!` script run through
+        // `exec` sees the full_pathname string as its $0.
+        let (command, _) = crate::executor::path::external_command_for_named_program_with_exec_name(
             program,
             Some(command_name),
             operands,
@@ -1023,6 +1123,7 @@ fn external_exec_process(
             env_vars
                 .get("BASH_ARGV0")
                 .is_some_and(|value| !value.is_empty()),
+            Some(&exec_filename),
         );
         command
     };
@@ -1036,39 +1137,93 @@ fn external_exec_process(
     let _ = argv0;
     // G-02: the exec'd image starts in the session cwd (for the true
     // replacement path, std's exec applies the chdir before execve).
-    process.current_dir(cwd);
+    // rubash#3286: the stamp is the Executor's stamp_spawn_cwd
+    // decision carried on ChildFdSetup — a resolving cwd keeps
+    // current_dir; a dead cwd the anchor names becomes the same
+    // pre_exec fchdir the Command faces register (the child is born
+    // in the session's dead inode, as GNU's inherited cwd is); a
+    // dead cwd no anchor names stays unstamped rather than failing
+    // the spawn on the dead spelling.
+    match cwd_stamp {
+        crate::executor::ChildCwdStamp::Path => {
+            process.current_dir(cwd);
+        }
+        crate::executor::ChildCwdStamp::AnchorFd(fd) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // SAFETY: the closure runs in the forked child (or in
+                // process for Command::exec) before execve and only
+                // fchdir's onto the anchor handle the session state
+                // keeps open — the same contract stamp_spawn_cwd's
+                // closure documents; fchdir is async-signal-safe.
+                unsafe {
+                    process.pre_exec(move || {
+                        if libc::fchdir(fd) == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = fd;
+        }
+        crate::executor::ChildCwdStamp::Unstamped => {}
+    }
     process.env_clear();
     if !clean_env {
         apply_exported_environment(&mut process, env_vars);
         crate::executor::path::apply_required_windows_child_environment(&mut process, env_vars);
+        // rubash#3310: GNU builtins/exec.def:193-201 — `exec` replaces
+        // the shell, so adjust_shell_level(-1) runs before
+        // maybe_make_export_env (variables.c:848-890), unless this is
+        // `exec -c` (cleanenv, handled by the enclosing `if`) or the
+        // builtin runs inside a `( )` subshell (SUBSHELL_PAREN: the
+        // exec'd program takes the subshell's place, so the level
+        // stands). The stamp is unconditional inside this arm: GNU
+        // binds SHLVL even when it was absent, unparseable, or
+        // unexported (adjust_shell_level binds + auto-exports), so
+        // the child env gains the adjusted value rather than
+        // inheriting the shell's live level. The shell's own SHLVL
+        // is never touched — on a failed execve GNU restores it with
+        // adjust_shell_level(1), which here is a no-op by
+        // construction. Same arithmetic as the exec-replace tail's
+        // exec_replace_adjusted_shlvl (external_inner.rs), but read
+        // from env_vars directly: prefix temp assignments are
+        // visible to the builtin (GNU: `SHLVL=9 exec ...` yields 8),
+        // while the tail path must use its frozen dispatch snapshot.
+        // Known gap: a pipeline element also carries the paren
+        // latch (see the call sites), so it is skipped here while
+        // GNU decrements it — see REPORT.md.
+        if !in_subshell_paren {
+            process.env("SHLVL", exec_decremented_shlvl(env_vars));
+        }
     }
+    // rubash#3219: an exec simulation born inside an in-process fork
+    // region hands the child the region's recorded ulimit pairs —
+    // GNU's exec'd image inherits the forked subshell's own rlimit
+    // pair (see builtins/ulimit.rs emulated_limit_pairs). No-op when
+    // no emulated-limit cells exist (every top-level exec).
+    crate::builtins::ulimit::arm_emulated_limits(&mut process, env_vars);
     crate::executor::path::suppress_orphan_console(&mut process);
     process
 }
 
-/// GNU general.c:909-922 full_pathname: a word that is already absolute is
-/// returned as-is; anything else gets the current working directory
-/// prepended and `.` path components removed (sh_makepath MP_DOCWD|MP_RMDOT
-/// — no symlink resolution). Applied to the slash form so the child shell
-/// sees a forward-slash absolute script name.
-fn full_pathname_word(program: &std::path::Path, cwd: &std::path::Path) -> String {
-    let display = program.to_string_lossy().replace('\\', "/");
-    let bytes = display.as_bytes();
-    let absolute =
-        display.starts_with('/') || (bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/');
-    if absolute {
-        return display;
-    }
-    // G-02: general.c's "current working directory" is the session cwd.
-    let cwd = cwd.to_string_lossy().replace('\\', "/");
-    let joined = format!("{cwd}/{display}");
-    let mut parts: Vec<&str> = Vec::new();
-    for part in joined.split('/') {
-        if !part.is_empty() && part != "." {
-            parts.push(part);
-        }
-    }
-    parts.join("/")
+/// GNU variables.c:848-890 `adjust_shell_level(-1)` for the exec
+/// builtin's child environment: an absent, empty, or unparseable
+/// SHLVL counts as 0, the level drops by 1, and clamps at 0. The
+/// >= 1000 warning-and-reset-to-1 arm is not reproduced here — it
+/// is likewise absent from the sibling ports (initialize_shell_level,
+/// exec_replace_adjusted_shlvl), so a one-face warning would split
+/// the spelling; see REPORT.md.
+fn exec_decremented_shlvl(env_vars: &crate::shell::var_table::VarTable) -> String {
+    let current = env_vars
+        .get("SHLVL")
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    (current - 1).max(0).to_string()
 }
 
 fn apply_exported_environment(process: &mut Command, env_vars: &crate::shell::var_table::VarTable) {
@@ -1094,6 +1249,7 @@ fn run_printenv_fallback<W>(
     names: &[String],
     env_vars: &crate::shell::var_table::VarTable,
     clean_env: bool,
+    in_subshell_paren: bool,
     stdout: &mut W,
 ) -> io::Result<i32>
 where
@@ -1107,20 +1263,40 @@ where
         });
     }
 
+    // rubash#3310: the emulation stands in for the exec'd printenv
+    // image, so it reports the same adjusted SHLVL the spawn path
+    // stamps (exec.def:200, variables.c:848-890) — including when
+    // SHLVL was absent or unexported, which adjust_shell_level binds
+    // and auto-exports into the child env.
+    let adjusted_shlvl = (!in_subshell_paren).then(|| exec_decremented_shlvl(env_vars));
+
     let exported = env_vars.marked_names(EXPORTED_VARS);
     // GNU variables.c make_env_array_from_var_list: array and associative
     // variables never cross the child env boundary (rubash#534) — the
     // internal printenv emulation must mirror the real spawn path.
     let arrays = env_vars.marked_names(crate::executor::types::ARRAY_VARS);
     let assocs = env_vars.marked_names(crate::executor::types::ASSOC_VARS);
-    let exported: Vec<String> = exported
+    let mut exported: Vec<String> = exported
         .into_iter()
         .filter(|name| !arrays.iter().any(|n| n == name) && !assocs.iter().any(|n| n == name))
         .collect();
+    if adjusted_shlvl.is_some()
+        && !exported.iter().any(|name| name == "SHLVL")
+        && !arrays.iter().any(|name| name == "SHLVL")
+        && !assocs.iter().any(|name| name == "SHLVL")
+    {
+        exported.push("SHLVL".to_string());
+    }
     if names.is_empty() {
         let mut exported = exported;
         exported.sort();
         for name in exported {
+            if name == "SHLVL" {
+                if let Some(adjusted) = &adjusted_shlvl {
+                    writeln!(stdout, "SHLVL={adjusted}")?;
+                    continue;
+                }
+            }
             if let Some(value) = env_vars.get(&name) {
                 writeln!(stdout, "{name}={value}")?;
             }
@@ -1130,6 +1306,12 @@ where
 
     let mut found_all = true;
     for name in names {
+        if name == "SHLVL" {
+            if let Some(adjusted) = &adjusted_shlvl {
+                writeln!(stdout, "{adjusted}")?;
+                continue;
+            }
+        }
         if exported.iter().any(|exported_name| exported_name == name) {
             if let Some(value) = env_vars.get(name) {
                 writeln!(stdout, "{value}")?;

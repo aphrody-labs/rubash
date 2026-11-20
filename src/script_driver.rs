@@ -18,7 +18,7 @@ use crate::executor::{ExecuteError, Executor};
 use crate::history::SessionHistory;
 use crate::history_expand::{HistChars, HistCtx};
 use crate::lexer::{
-    expand_aliases_in_source_marked, tokenize, tokenize_with_initial_posix,
+    expand_aliases_in_source_marked_with_comsubs, tokenize, tokenize_with_initial_posix,
     tokenize_with_initial_posix_marked, AliasLookup, Token, TokenKind,
 };
 use crate::parser::CommandNode;
@@ -429,21 +429,15 @@ pub fn script_uses_runtime_parse_gates(contents: &str) -> bool {
 /// (parse.y:5751-5769): posix keeps reserved words as keywords, default
 /// mode lets an alias replace them (rubash#414).
 pub(crate) fn expand_group_aliases(executor: &Executor, source: &str) -> String {
-    expand_group_aliases_marked(executor, source).0
+    expand_group_aliases_inner(executor, source).0
 }
 
-/// `expand_group_aliases` plus the byte offsets of newlines the
-/// expansion itself introduced — GNU consumes pushed alias text through
-/// shell_getc without the yy_readline_get line_number bump
-/// (parse.y:2504), so those newlines must not advance the token line
-/// stamps (rubash#3605 run-nquote: `alias foo=$'echo foo\\n\\nquux\\n'`
-/// + `foo` on line N reports `quux` at line N, not N+2).
-pub(crate) fn expand_group_aliases_marked(
+fn expand_group_aliases_inner(
     executor: &Executor,
     source: &str,
-) -> (String, Vec<usize>) {
+) -> (String, Vec<usize>, Vec<(String, Vec<usize>)>) {
     if !executor.alias_expansion_enabled() || executor.shell_state.aliases.is_empty() {
-        return (source.to_string(), Vec::new());
+        return (source.to_string(), Vec::new(), Vec::new());
     }
     let posix = executor.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
     let lookup = move |word: &str| {
@@ -456,7 +450,28 @@ pub(crate) fn expand_group_aliases_marked(
             )
         })
     };
-    expand_aliases_in_source_marked(source, &lookup as &AliasLookup<'_>, posix)
+    expand_aliases_in_source_marked_with_comsubs(source, &lookup as &AliasLookup<'_>, posix)
+}
+
+/// `expand_group_aliases` plus the byte offsets of newlines the
+/// expansion itself introduced — GNU consumes pushed alias text through
+/// shell_getc without the yy_readline_get line_number bump
+/// (parse.y:2504), so those newlines must not advance the token line
+/// stamps (rubash#3605 run-nquote: `alias foo=$'echo foo\\n\\nquux\\n'`
+/// + `foo` on line N reports `quux` at line N, not N+2).
+/// Also records per-comsub-body expansion newline marks on `executor`
+/// (rubash#3838).
+pub(crate) fn expand_group_aliases_marked(
+    executor: &mut Executor,
+    source: &str,
+) -> (String, Vec<usize>) {
+    let (expanded, marks, comsub_records) = expand_group_aliases_inner(executor, source);
+    if !comsub_records.is_empty() {
+        executor
+            .shell_state
+            .record_comsub_alias_newlines(comsub_records);
+    }
+    (expanded, marks)
 }
 
 /// shell.c run_pending_command style driver for scripts with history on:
@@ -2603,6 +2618,19 @@ fn advance_quote_state(state: Option<char>, text: &str) -> Option<char> {
             }
             _ => match c {
                 '\\' => i += 1,
+                '$' if chars.get(i + 1) == Some(&'\'') => {
+                    // ANSI-C `$'...'`: escape-aware close scan
+                    // (parse.y:5476-5480 — `\'` inside is an escaped
+                    // quote, not the terminator).
+                    i += 2;
+                    while i < chars.len() {
+                        match chars[i] {
+                            '\\' => i += 2,
+                            '\'' => break,
+                            _ => i += 1,
+                        }
+                    }
+                }
                 '\'' | '"' | '`' => state = Some(c),
                 '#' if i == 0 || matches!(chars[i - 1], ' ' | '\t' | ';' | '\n') => break,
                 _ => {}
@@ -2664,7 +2692,7 @@ pub fn stdin_source_needs_more(source: &str) -> bool {
 /// read_token fails inside the compound's own token read), so none of
 /// the compound — and nothing else on its opening line — ever runs,
 /// and the compound-EOF diagnostic is never printed (rubash#1589).
-fn unclosed_compound_open_line(text: &str) -> Option<usize> {
+pub(crate) fn unclosed_compound_open_line(text: &str) -> Option<usize> {
     let tokens = tokenize(text);
     let mut stack: Vec<(&str, usize)> = Vec::new();
     for token in &tokens {
@@ -3640,6 +3668,19 @@ pub fn inject_console_ctrl_c() {
     crate::builtins::kill::note_console_ctrl_c();
 }
 
+/// Tier B host hook (PLAN row 11, M-3): note a console Ctrl+Z the
+/// host's own input watch received, so the engine's in-process waits
+/// see the stop request (rubash#3467, companion to niubash#877).
+/// This is the driver-layer face hosts consume; it delegates to the
+/// kill builtin's mailbox plumbing
+/// (`builtins::kill::note_console_ctrl_z`), which is internal from
+/// this row on. On Unix it is a no-op by design: the kernel delivers
+/// SIGTSTP to the foreground process group and waitpid reports the
+/// stop — there is no console keypress to forward.
+pub fn inject_console_ctrl_z() {
+    crate::builtins::kill::note_console_ctrl_z();
+}
+
 /// Tier B host hook (PLAN row 11, M-3): consume the background
 /// wrapper handshake from a host launcher's argv before the
 /// host's own option parsing sees it — the driver-layer face of
@@ -3696,7 +3737,11 @@ pub(crate) fn run_source_pre_lexed_with_line_offset(
 /// (quotes, `${`, `$(`, array lists, `[` subscripts) are read-time
 /// matched-pair verdicts the tokenizer does not model and are never
 /// overridden here.
-fn command_paren_verdict_disproved_by_parser(input: &str, parse_posix: bool) -> bool {
+fn command_paren_verdict_disproved_by_parser(
+    executor: &Executor,
+    input: &str,
+    parse_posix: bool,
+) -> bool {
     let Some(unclosed) = crate::lexer::unclosed_input_close_char_posix(input, parse_posix) else {
         return false;
     };
@@ -3715,6 +3760,23 @@ fn command_paren_verdict_disproved_by_parser(input: &str, parse_posix: bool) -> 
         return false;
     }
     if crate::lexer::dparen_arith_group_never_closes(input, open_line) {
+        return false;
+    }
+    // rubash#3904 (A29): when the shape scan positively identifies a
+    // token error at a compound-assignment list's own level, the real
+    // parser's pre-EOF event marker for the never-closed list
+    // (__RUBASH_PARSE_ERROR_EOF_PAREN__, rubash#413) is NOT the first
+    // error event — GNU's token loop fails on the token before EOF is
+    // classified (parse.y:7141-7159) — so the verdict is not disproved
+    // by any marker the parser raises for the list's EOF. Let the
+    // unclosed route run and print the token error.
+    if matches!(
+        crate::lexer::unclosed_comsub_eof_shape(input, crate::lexer::parse_extended_glob()),
+        Some((
+            crate::lexer::UnclosedComsubShape::CompassignTokenError { .. },
+            _
+        ))
+    ) {
         return false;
     }
     let tokens = tokenize_with_initial_posix(input, parse_posix);
@@ -3745,6 +3807,19 @@ fn command_paren_verdict_disproved_by_parser(input: &str, parse_posix: bool) -> 
         // `expected `)'` sequence), so yield the route exactly then.
         // Any other marker family present (subshell, compound
         // assignment, ...) keeps the route's diagnostic.
+        // rubash#3306: a clean parse whose only error lives inside a
+        // command-substitution body (the markers sit on the
+        // substitution node, invisible to the tree predicates) also
+        // disproves the verdict — GNU died on the body token at the
+        // `)` (parse.y:4549-4555 parse_comsub) and the read-time
+        // screen prints it. Every other !command_position verdict
+        // keeps the route's diagnostic (unclosed compassign EOF,
+        // stray-paren families, ...).
+        if !ast.commands.iter().any(command_tree_has_parse_error)
+            && executor.comsub_body_error_pending(&ast.commands)
+        {
+            return true;
+        }
         return ast.commands.iter().any(command_tree_has_cond_marker)
             && !ast
                 .commands
@@ -3862,6 +3937,44 @@ fn command_tree_has_near_marker(command: &CommandNode) -> bool {
     command_tree_walk_nested(command, command_tree_has_near_marker)
 }
 
+/// True when this command (or any nested command) carries a HARD
+/// parse failure — a token the parser rejected (`__RUBASH_PARSE_ERROR_NEAR__`,
+/// a plain `__RUBASH_PARSE_ERROR__` "unexpected token" value, a
+/// `__RUBASH_PARSE_ERROR_COND__` condition error, or a
+/// `__RUBASH_COMPOUND_SYNTAX_ERROR*` compound error). GNU's reader hits
+/// these at the offending token's position, before EOF inside any
+/// matched pair is ever reached, so they preempt the unclosed-pair
+/// verdict (rubash#3641). The end-of-input marker family is excluded:
+/// an unclosed keyword compound only reports "from `X' command" when
+/// the reader reaches clean EOF, which a pair error inside it beats
+/// (parse.y:6883-6901 checks shell_eof_token before compoundcmd_top).
+pub(crate) fn command_tree_has_hard_parse_error(command: &CommandNode) -> bool {
+    let hard = command.assignments.iter().any(|(name, value)| {
+        name == "__RUBASH_PARSE_ERROR_NEAR__"
+            || name == "__RUBASH_PARSE_ERROR_COND__"
+            || name.starts_with("__RUBASH_COMPOUND_SYNTAX_ERROR")
+            || (name == "__RUBASH_PARSE_ERROR__" && value.starts_with("unexpected token"))
+    });
+    hard || command_tree_walk_nested(command, command_tree_has_hard_parse_error)
+}
+
+/// True when this command (or any nested command) carries an
+/// end-of-input verdict — the `__RUBASH_PARSE_ERROR_EOF*` marker family
+/// or the plain `__RUBASH_PARSE_ERROR__` "unexpected end of file"
+/// value (the incomplete-input family; hard `unexpected token'
+/// diagnostics are excluded). Trap-action prefix screening uses this
+/// to tell a complete command list from one GNU's parse_and_execute
+/// reader loop would still be gathering (rubash#3641).
+pub(crate) fn command_tree_has_eof_parse_error(command: &CommandNode) -> bool {
+    if command.assignments.iter().any(|(name, value)| {
+        name.starts_with("__RUBASH_PARSE_ERROR_EOF")
+            || (name == "__RUBASH_PARSE_ERROR__" && value.starts_with("unexpected end of file"))
+    }) {
+        return true;
+    }
+    command_tree_walk_nested(command, command_tree_has_eof_parse_error)
+}
+
 /// True when this command (or any nested command) carries one of the
 /// end-of-input marker family — the parse only failed for want of
 /// more input, so an interactive reader should keep gathering.
@@ -3902,7 +4015,11 @@ fn command_tree_has_hard_token_error(command: &CommandNode) -> bool {
 /// gathering; GNU reports it when the compound completes). Anything
 /// else — clean parses, pure EOF shortfalls, unterminated quotes or
 /// substitutions (which carry no marker) — is genuinely incomplete.
-fn interactive_pending_is_hard_syntax_error(input: &str, parse_posix: bool) -> bool {
+fn interactive_pending_is_hard_syntax_error(
+    executor: &Executor,
+    input: &str,
+    parse_posix: bool,
+) -> bool {
     let tokens = tokenize_with_initial_posix(input, parse_posix);
     if crate::lexer::heredoc_overflow_line().is_some() {
         return false;
@@ -3917,6 +4034,17 @@ fn interactive_pending_is_hard_syntax_error(input: &str, parse_posix: bool) -> b
         },
     );
     if ast.commands.iter().any(command_tree_has_near_marker) {
+        return true;
+    }
+    // rubash#3306: a command substitution whose extracted body already
+    // carries a hard parse error is wrong at the `)` that closed it —
+    // GNU's parse_comsub yyparse dies on the body token while reading
+    // (parse.y:4549-4555, 6858-6865), it does not wait for more input.
+    // The tree predicates cannot see the body's markers (they live on
+    // the comsub node, not in the tree), so ask the body walker
+    // directly; a body that merely ran out stays "incomplete" exactly
+    // like an unclosed `(`.
+    if executor.comsub_body_error_pending(&ast.commands) {
         return true;
     }
     ast.commands.iter().any(command_tree_has_hard_token_error)
@@ -4553,8 +4681,25 @@ fn run_source_impl_inner_body(
         && !interactive
         && crate::lexer::has_unclosed_input_syntax_posix(input, parse_posix)
         && !input.contains("<<")
-        && !command_paren_verdict_disproved_by_parser(input, parse_posix);
+        && !command_paren_verdict_disproved_by_parser(executor, input, parse_posix);
     if unclosed_route || (extglob_eof_line.is_some() && !input.contains("<<")) {
+        // rubash#3899/#3900: whether a compound array assignment is open
+        // anywhere in the delimiter stack at EOF. GNU's EOF inside
+        // parse_compound_assignment's token loop (parse.y:7104) runs
+        // set_exit_status (EXECUTION_FAILURE) after its parser_error
+        // (parse.y:7151-7152, set at parse.y:7167-7169), so the status
+        // stays 1: the `error yacc_EOF' production (parse.y:484-493)
+        // forces EX_BADUSAGE=2 only on a still-zero status. The
+        // diagnostic itself (closer + line) still belongs to the
+        // innermost failed scan; only the status changes.
+        // error.c:324-327 (parser_error's exit_immediately_on_error
+        // tail) forces 2 under live errexit. The close-char scan's
+        // `array_list` bit is exactly "an array-list frame is open in
+        // the stack", so every arm of this route consults it.
+        let compound_assignment_open =
+            crate::lexer::unclosed_input_close_char_posix(input, parse_posix)
+                .map(|u| u.array_list)
+                .unwrap_or(false);
         // GNU parse.y:5635-5643 read_token_word + parse_matched_pair
         // (parse.y:3906-3912): an unclosed array subscript `[` reports
         // `unexpected EOF while looking for matching `]'' at the line the
@@ -4668,9 +4813,21 @@ fn run_source_impl_inner_body(
                     Some(eof.report_line + line_offset),
                 );
             }
-            executor.errexit_live_at_diagnostic();
-            executor.set_last_exit_code(2);
-            return 2;
+            // rubash#3899: a `$[` hunt that dies inside a compound
+            // array assignment is consumed by parse_compound_
+            // assignment's token loop like any other failed element
+            // word (GNU 5.3.20 probe: `v=(a $[1+` -> `]' at the
+            // opener's line, exit 1), so the status split is the
+            // route-wide one: 1 with an array list open, 2 otherwise,
+            // and 2 under live errexit either way.
+            let errexit_live = executor.errexit_live_at_diagnostic();
+            let status = if compound_assignment_open && !errexit_live {
+                1
+            } else {
+                2
+            };
+            executor.set_last_exit_code(status);
+            return status;
         }
         // rubash#3229: an unclosed extglob pattern group — GNU
         // read_token_word's parse_matched_pair scan (parse.y:5466-5489)
@@ -4726,9 +4883,19 @@ fn run_source_impl_inner_body(
                     Some(open_line + line_offset),
                 );
             }
-            executor.errexit_live_at_diagnostic();
-            executor.set_last_exit_code(2);
-            return 2;
+            // rubash#3899: same split as the `$[` arm — an extglob
+            // group that dies inside a compound array assignment is
+            // a failed element word of parse_compound_assignment
+            // (GNU 5.3.20 probe: `v=(a +(x` -> exit 1), while the
+            // bare `echo +(x` keeps 2.
+            let errexit_live = executor.errexit_live_at_diagnostic();
+            let status = if compound_assignment_open && !errexit_live {
+                1
+            } else {
+                2
+            };
+            executor.set_last_exit_code(status);
+            return status;
         }
         // GNU's incremental reader executes complete input lines before the
         // line where the unclosed construct opened; that line itself is part
@@ -4809,6 +4976,13 @@ fn run_source_impl_inner_body(
                 // `((` arithmetic root, `for ((` pair) already keep
                 // those families out of the ComsubBodyTokenError class,
                 // so only genuine body token errors defer.
+                // rubash#3904 (A29): the same deferral for a token
+                // error at a compound-assignment list's own level —
+                // inside an enclosing subshell (`(v=(a (echo`) the
+                // command-position branch's fallthrough would report
+                // the subshell's EOF, but GNU's parse fails on the
+                // list's token first; the CompassignTokenError arm
+                // below renders it.
                 if close == ')'
                     && command
                     && !matches!(
@@ -4817,7 +4991,8 @@ fn run_source_impl_inner_body(
                             crate::lexer::parse_extended_glob()
                         ),
                         Some((
-                            crate::lexer::UnclosedComsubShape::ComsubBodyTokenError { .. },
+                            crate::lexer::UnclosedComsubShape::ComsubBodyTokenError { .. }
+                                | crate::lexer::UnclosedComsubShape::CompassignTokenError { .. },
                             _
                         ))
                     )
@@ -4971,6 +5146,63 @@ fn run_source_impl_inner_body(
                     executor.errexit_live_at_diagnostic();
                     executor.set_last_exit_code(2);
                     return 2;
+                } else if let Some((
+                    crate::lexer::UnclosedComsubShape::CompassignTokenError {
+                        line,
+                        token,
+                        in_comsub,
+                    },
+                    _,
+                )) = crate::lexer::unclosed_comsub_eof_shape(
+                    input,
+                    crate::lexer::parse_extended_glob(),
+                ) {
+                    // rubash#3904 (A29): a non-WORD token at a compound-
+                    // assignment list's own level — a bare `(` or the
+                    // first metachar token — is a yyerror token error,
+                    // not an EOF diagnostic: parse_compound_assignment's
+                    // token loop (parse.y:7141-7159) hands it to
+                    // report_syntax_error (parse.y:6833-6865), which
+                    // names the token (with the matching suffix when the
+                    // list sits inside a command/process substitution,
+                    // parse.y:6858-6859) and echoes the offending line.
+                    // Status follows the loop's own
+                    // set_exit_status(EXECUTION_FAILURE)
+                    // (parse.y:7167-7169): 1, or 2 when parser_error's
+                    // exit_immediately_on_error tail fires under live
+                    // errexit (error.c:324-327) — which is also why the
+                    // offending line is NOT echoed then: parser_error
+                    // exits before print_offending_line runs
+                    // (parse.y:6863-6865).
+                    let report = line + line_offset;
+                    let prefix = executor.parser_error_prefix_for_line(report);
+                    let suffix = if in_comsub {
+                        " while looking for matching `)'"
+                    } else {
+                        ""
+                    };
+                    unclosed_report!(
+                        "{prefix}syntax error near unexpected token `{token}'{suffix}"
+                    );
+                    if !suppress_unclosed_diagnostic {
+                        executor.record_run_diagnostic(
+                            format!("syntax error near unexpected token `{token}'{suffix}"),
+                            Some(report),
+                        );
+                    }
+                    if executor.errexit_live_at_diagnostic() {
+                        executor.set_last_exit_code(2);
+                        return 2;
+                    }
+                    if !executor.invocation_interactive() {
+                        let offending = input
+                            .lines()
+                            .nth(line.saturating_sub(1))
+                            .unwrap_or_default();
+                        unclosed_report!("{prefix}`{offending}'");
+                    }
+                    executor.set_last_exit_code(1);
+                    return 1;
                 } else {
                     let reported = if report_open { global_open } else { global_eof };
                     unclosed_report!(
@@ -4983,6 +5215,34 @@ fn run_source_impl_inner_body(
                             Some(reported),
                         );
                     }
+                    // GNU 5.3.20 exits 2 for unmatched-delimiter EOF
+                    // diagnostics (confirmed for word-internal pairs
+                    // `'`, `"`, `` ` ``, `${`, `$[`, `a[`, `$((`, `((`
+                    // as well as `$(` and command-position constructs)
+                    // — EXCEPT when a compound array assignment is open
+                    // anywhere in the stack: the failed word read is
+                    // then consumed by parse_compound_assignment's
+                    // token loop, which runs set_exit_status
+                    // (EXECUTION_FAILURE) (parse.y:7167-7169) after the
+                    // innermost scan's diagnostic, and the
+                    // `error yacc_EOF' production forces 2 only on a
+                    // still-zero status (parse.y:484-493). So an open
+                    // array list keeps the status at 1 (rubash#3899:
+                    // the plain `name=(` list; rubash#3900: a procsub
+                    // element `v=(<(echo` reporting at the EOF line),
+                    // unless parser_error's exit_immediately_on_error
+                    // tail fires under live errexit (error.c:324-327).
+                    if array_list {
+                        let status = if executor.errexit_live_at_diagnostic() {
+                            2
+                        } else {
+                            1
+                        };
+                        executor.set_last_exit_code(status);
+                        return status;
+                    }
+                    executor.set_last_exit_code(2);
+                    return 2;
                 }
                 // GNU exits 1 for an unterminated `name=(` array list —
                 // but error.c:324-327 forces exit status 2 whenever
@@ -5339,8 +5599,65 @@ pub(crate) fn process_console_size() -> Option<(i32, i32)> {
     None
 }
 
+/// (rows, cols) of the terminal behind `fd` via TIOCGWINSZ, or None
+/// when the fd is not a terminal or reports a degenerate size.
+/// winsize.c tcgetwinsize is plain ioctl(fd, TIOCGWINSZ, &win); the
+/// get_new_window_size caller only trusts ws_row > 0 && ws_col > 0,
+/// so a zero dimension is None here rather than a size the callers
+/// would have to re-filter (rubash#3330: the unix stub returned None
+/// unconditionally, so every COLUMNS-unset consumer fell back to 80).
+#[cfg(not(windows))]
+fn unix_console_size_of_fd(fd: libc::c_int) -> Option<(i32, i32)> {
+    // SAFETY: ioctl TIOCGWINSZ writes a plain winsize struct; the
+    // fd is borrowed, never owned or closed here.
+    unsafe {
+        let mut win: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut win) != 0 {
+            return None;
+        }
+        if win.ws_row > 0 && win.ws_col > 0 {
+            Some((i32::from(win.ws_row), i32::from(win.ws_col)))
+        } else {
+            None
+        }
+    }
+}
+
+/// Unix analog of the controlling-terminal winsize query
+/// (winsize.c:97 input_tty -> tcgetwinsize): the process console,
+/// found via /dev/tty (GNU's shell_tty — the fd jobs.c opens on the
+/// controlling terminal at startup, falling back to stderr) so it
+/// works even when stdin/stdout/stderr are all redirected, with the
+/// std fds as fallbacks (stderr first, GNU's input_tty fallback).
 #[cfg(not(windows))]
 pub(crate) fn process_console_size() -> Option<(i32, i32)> {
+    // SAFETY: plain open/close of the terminal device; the fd is
+    // closed before returning. Opening /dev/tty never acquires a
+    // controlling terminal (only a by-path open of the tty device
+    // does that — see acquire_controlling_terminal); without one
+    // the open fails and we fall through to the std fds.
+    unsafe {
+        let dev_tty = b"/dev/tty\0";
+        let fd = libc::open(
+            dev_tty.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        );
+        if fd >= 0 {
+            let size = unix_console_size_of_fd(fd);
+            libc::close(fd);
+            if size.is_some() {
+                return size;
+            }
+        }
+    }
+    // GNU's input_tty fallback is stderr; stdin/stdout follow so a
+    // session whose stderr is redirected but whose stdin or stdout
+    // is still a tty reports its size.
+    for fd in [libc::STDERR_FILENO, libc::STDIN_FILENO, libc::STDOUT_FILENO] {
+        if let Some(size) = unix_console_size_of_fd(fd) {
+            return Some(size);
+        }
+    }
     None
 }
 
@@ -5351,9 +5668,14 @@ fn stdin_console_size() -> Option<(i32, i32)> {
     windows_console_size_of(std::io::stdin().as_raw_handle() as *mut _)
 }
 
+/// Size of the console on STDIN itself (readline's rl_instream winsize:
+/// lib/readline/terminal.c _rl_get_screen_size ioctls the tty fd).
+/// Same TIOCGWINSZ query as the process console above; the unix stub
+/// used to return None, so the screen-size bind never saw a stdin
+/// terminal (rubash#3330).
 #[cfg(not(windows))]
 fn stdin_console_size() -> Option<(i32, i32)> {
-    None
+    unix_console_size_of_fd(libc::STDIN_FILENO)
 }
 
 /// variables.c:1039 sh_set_lines_and_columns: bind LINES then COLUMNS as
@@ -5676,40 +5998,140 @@ pub fn acquire_controlling_terminal() {
 #[cfg(not(unix))]
 pub fn acquire_controlling_terminal() {}
 
+/// The outcome of GNU's job-control availability determination
+/// (jobs.c:4731-4869 `initialize_job_control`): a terminal the shell
+/// can take, no terminal at all, or a terminal whose foreground
+/// process group the shell cannot join (the background bail,
+/// jobs.c:4797).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalAvailability {
+    /// Foreground on the controlling terminal: job control on.
+    Available,
+    /// No controlling terminal to take (the #2948 face): monitor
+    /// off, both diagnostics.
+    Unavailable,
+    /// A controlling terminal exists but the shell stayed in a
+    /// background process group through the SIGTTIN wait
+    /// (jobs.c:4786-4810): monitor off, only the background
+    /// diagnostic — the `goto just_bail` skips the second line.
+    BackgroundBail,
+}
+
 /// Whether this process can take a controlling terminal for job
-/// control (GNU jobs.c:4755-4766): stderr is already a terminal, or
-/// /dev/tty opens. GNU reaches for /dev/tty only when
-/// forced_interactive made stderr's shape irrelevant; every caller
-/// of the establishment below is an interactive entry, which is
-/// exactly that population — and the arm is load-bearing there,
-/// since GNU establishes job control when /dev/tty opens while
-/// stdin (and even stderr) is piped. Non-unix hosts have no
-/// /dev/tty: the console on stderr is the whole question (the same
-/// honest port the binary's `-m` arm makes).
+/// control (GNU jobs.c:4731-4869 `initialize_job_control`): stderr
+/// is already a terminal, or /dev/tty opens (jobs.c:4755-4766 — GNU
+/// reaches for /dev/tty only when forced_interactive made stderr's
+/// shape irrelevant; every caller of the establishment below is an
+/// interactive entry, which is exactly that population — and the arm
+/// is load-bearing there, since GNU establishes job control when
+/// /dev/tty opens while stdin (and even stderr) is piped). That is
+/// only the first half: rubash#3321 — a terminal that merely EXISTS
+/// is not one the shell can take. GNU then waits to become the
+/// terminal's foreground process group (jobs.c:4786-4810): while
+/// `tcgetpgrp` says otherwise it restores SIGTTIN to DFL and stops
+/// itself, and after the 18th kill (`tty_sigs++ > 16`, the
+/// comparison uses the pre-increment value) it bails with job
+/// control off. A shell that only asks "is stderr a tty /
+/// does /dev/tty open" never stops and never reports the failure, so
+/// a background process group with a controlling terminal was
+/// misjudged as job-control-available. Non-unix hosts have no
+/// /dev/tty and no process groups: the console on stderr is the
+/// whole question (the same honest port the binary's `-m` arm makes).
 #[cfg(unix)]
-fn controlling_terminal_available() -> bool {
-    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        return true;
-    }
-    // SAFETY: plain open/close of the terminal device; no retained
-    // state.
-    unsafe {
-        let dev_tty = b"/dev/tty\0";
-        let fd = libc::open(
-            dev_tty.as_ptr() as *const libc::c_char,
-            libc::O_RDWR | libc::O_NONBLOCK,
-        );
-        if fd >= 0 {
-            libc::close(fd);
-            return true;
+fn controlling_terminal_available() -> TerminalAvailability {
+    use std::os::unix::io::RawFd;
+    // GNU shell_tty selection (jobs.c:4749-4766): stderr when it is
+    // a tty, else open("/dev/tty"). The fd stays open while the
+    // foreground check runs; an opened /dev/tty is owned and closed
+    // on the way out.
+    let (tty_fd, owned): (RawFd, bool) = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        (libc::STDERR_FILENO, false)
+    } else {
+        // SAFETY: plain open of the terminal device; no retained
+        // state.
+        let fd = unsafe {
+            let dev_tty = b"/dev/tty\0";
+            libc::open(
+                dev_tty.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return TerminalAvailability::Unavailable;
+        }
+        (fd, true)
+    };
+    let outcome = {
+        let shell_pgrp = shell_process_group_id();
+        let mut tty_sigs = 0;
+        loop {
+            // SAFETY: tcgetpgrp on a tty fd; -1 on error.
+            let terminal_pgrp = unsafe { libc::tcgetpgrp(tty_fd) };
+            if terminal_pgrp == -1 {
+                // No terminal to take (the fd is not a terminal
+                // after all): the #2948 face.
+                break TerminalAvailability::Unavailable;
+            }
+            if terminal_pgrp == shell_pgrp {
+                break TerminalAvailability::Available;
+            }
+            // Background group (jobs.c:4790-4806): restore SIGTTIN
+            // to DFL and stop until foregrounded. The disposition
+            // is restored right after the kill returns — or after
+            // the process is continued — exactly as GNU restores
+            // `ottin`. A blocked SIGTTIN makes the kill return at
+            // once, so the loop spins to the cap below instead of
+            // stopping.
+            // The stop must be delivered to THIS thread, not to
+            // the process group: rubash's main logic runs on a
+            // spawned worker thread (main.rs, 512MiB stack) while
+            // the OS thread parks in join, so a group-directed
+            // kill(0, SIGTTIN) lands on an arbitrary thread and
+            // the group stop reaches the looping thread only
+            // asynchronously — measured: the kill returns in
+            // 2-3us while the process keeps looping, and the loop
+            // can spin all 18 iterations before any stop takes
+            // effect (or stop a second time after fg). GNU is
+            // single-threaded, so its kill is synchronous by
+            // construction. pthread_kill to the looping thread
+            // stops that thread synchronously inside the call
+            // (measured 270-680us round-trip through fg+CONT in
+            // a C model, one iteration, deterministic over 10
+            // runs); the stop still arrests the whole process
+            // group, so the session leader's waitpid sees it
+            // exactly as with GNU's kill.
+            // SAFETY: signal() with a valid signo always succeeds
+            // and returns the previous disposition; pthread_self
+            // and pthread_kill are valid on this thread.
+            unsafe {
+                let old = libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+                libc::pthread_kill(libc::pthread_self(), libc::SIGTTIN);
+                libc::signal(libc::SIGTTIN, old);
+            }
+            // jobs.c:4798 `if (tty_sigs++ > 16)`: the comparison
+            // uses the pre-increment value, so the 18th kill bails.
+            if tty_sigs > 16 {
+                break TerminalAvailability::BackgroundBail;
+            }
+            tty_sigs += 1;
+        }
+    };
+    if owned {
+        // SAFETY: fd was opened above and is no longer needed.
+        unsafe {
+            libc::close(tty_fd);
         }
     }
-    false
+    outcome
 }
 
 #[cfg(not(unix))]
-fn controlling_terminal_available() -> bool {
-    std::io::IsTerminal::is_terminal(&std::io::stderr())
+fn controlling_terminal_available() -> TerminalAvailability {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        TerminalAvailability::Available
+    } else {
+        TerminalAvailability::Unavailable
+    }
 }
 
 /// The process-group number GNU's job-control diagnostics print:
@@ -5743,7 +6165,10 @@ pub fn shell_process_group_id() -> i32 {
 /// suppress it when the terminal can be taken (GNU `+m -i -c` under
 /// a PTY: `himBHc`). Establishment failure prints jobs.c:4844
 /// "cannot set terminal process group (%d)" and jobs.c:4858
-/// "no job control in this shell".
+/// "no job control in this shell" — except the background bail
+/// (jobs.c:4797), which prints only jobs.c:4797
+/// "initialize_job_control: no job control in background" and skips
+/// the second line via `goto just_bail`.
 ///
 /// This is the engine's single establishment funnel (rubash#2948):
 /// the binary's startup (main.rs apply_startup_job_control), the
@@ -5757,18 +6182,36 @@ pub fn establish_interactive_job_control(executor: &mut Executor) {
     if crate::executor::RESPAWNED_CHILD.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let established = controlling_terminal_available();
-    executor.set_shell_option("monitor", established);
-    if !established {
-        let shell_name = executor
-            .get_env("__RUBASH_SHELL_NAME")
-            .or_else(|| executor.get_env("BASH_ARGV0"))
-            .unwrap_or("bash");
-        eprintln!(
-            "{shell_name}: cannot set terminal process group ({}): Inappropriate ioctl for device",
-            shell_process_group_id()
-        );
-        eprintln!("{shell_name}: no job control in this shell");
+    let shell_name: String = executor
+        .get_env("__RUBASH_SHELL_NAME")
+        .or_else(|| executor.get_env("BASH_ARGV0"))
+        .unwrap_or("bash")
+        .to_string();
+    match controlling_terminal_available() {
+        TerminalAvailability::Available => {
+            executor.set_shell_option("monitor", true);
+        }
+        TerminalAvailability::Unavailable => {
+            executor.set_shell_option("monitor", false);
+            eprintln!(
+                "{shell_name}: cannot set terminal process group ({}): Inappropriate ioctl for device",
+                shell_process_group_id()
+            );
+            eprintln!("{shell_name}: no job control in this shell");
+        }
+        TerminalAvailability::BackgroundBail => {
+            executor.set_shell_option("monitor", false);
+            // jobs.c:4797 bails with `goto just_bail`, which skips
+            // the internal_error "no job control in this shell"
+            // line: this face prints only the background
+            // diagnostic. The strerror is GNU's deterministic errno
+            // for this face (EBADF, verified on both stderr shapes
+            // against 5.3.20); the pin asserts the stable prefix,
+            // not the suffix.
+            eprintln!(
+                "{shell_name}: initialize_job_control: no job control in background: Bad file descriptor"
+            );
+        }
     }
 }
 
@@ -5932,7 +6375,7 @@ pub fn run_interactive_stdin(executor: &mut Executor) -> i32 {
             // run below reports the error and the reader moves on).
             let group_complete = pending_heredocs.is_empty()
                 && (!stdin_source_needs_more_posix(&pending, stdin_posix)
-                    || interactive_pending_is_hard_syntax_error(&pending, stdin_posix));
+                    || interactive_pending_is_hard_syntax_error(executor, &pending, stdin_posix));
             if group_complete {
                 // rubash#2849: a group was just accepted for
                 // execution — the read that produced it has returned,

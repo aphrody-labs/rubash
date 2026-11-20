@@ -479,6 +479,22 @@ pub(crate) const QUOTED_EXPANSION_SITE: char = '\u{E31B}';
 /// `&str` companion of QUOTED_EXPANSION_SITE.
 pub(crate) const QUOTED_EXPANSION_SITE_STR: &str = "\u{E31B}";
 
+/// GNU `W_SPLITSPACE` port (command.h:79 "Split this word on ' '
+/// regardless of IFS"): an unquoted `$*`/`$@`/`${*}`/`${@}` piece produced
+/// while IFS was set-but-null marks the WHOLE word for a final split on
+/// spaces — `list_string(istring, " ", 1)` when IFS is set (including
+/// set-null), `" \t\n"` when unset (subst.c:11305 accumulate at :11535,
+/// final split at :12103-12107) — regardless of what a mid-word
+/// `${IFS:=...}` bind set IFS to afterwards (dollar-star7 family).
+/// Producers: embedded_parameters.rs `@`/`*` arms; consumers:
+/// arrays.rs field_split_values_with_ifs (split-charset override) and
+/// command_prepare.rs strip_ifs_protection_markers (non-split paths drop
+/// it). U+E31C continues the registry zone; a bare codepoint in transport
+/// is always protocol (typed `$'\uE31C'` arrives E400-escaped at entry).
+pub(crate) const SPLIT_ON_SPACES_SENTINEL: char = '\u{E31C}';
+/// `&str` companion of SPLIT_ON_SPACES_SENTINEL.
+pub(crate) const SPLIT_ON_SPACES_SENTINEL_STR: &str = "\u{E31C}";
+
 /// Injected tag marking a group-command redirect that the executor added
 /// (support_names.rs) — `\x1e`-prefixed so it sorts into the carrier family.
 pub(crate) const GROUP_REDIRECT_INJECTED_MARK: &str = "\u{1e}group-redirect";
@@ -610,6 +626,7 @@ pub(crate) const HASH_ENV_FIELD_SEP: char = SUBSCRIPT_CARRIER;
 // EXACT __RUBASH_BACKGROUND_WRAPPER - state key (background wrapper) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_BG_BASHPID_BASE - state key (bg bashpid base) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_BG_DEPTH - state key (bg depth) - serialized across the respawn/subshell boundary; see the owning subsystem
+// EXACT __RUBASH_BG_PAYLOAD_FACE - respawn payload face (rubash#3932): which GNU nofork face governs a respawned child's -c body (simple/subshell/procsub), consumed at init under the provenance gate
 // EXACT __RUBASH_CA1__ - RETIRED string spelling of the compound-assignment marker; typeable user text since retirement - do not re-register
 // EXACT __RUBASH_CAPCASE_VARS - serialized variable-name set (capcase) for child/subshell state transfer
 // EXACT __RUBASH_CMD_FILE - state key (cmd file) - serialized across the respawn/subshell boundary; see the owning subsystem
@@ -673,6 +690,7 @@ pub(crate) const HASH_ENV_FIELD_SEP: char = SUBSCRIPT_CARRIER;
 // EXACT __RUBASH_LAST_COMMAND - state key (last command) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_LINE_OFFSET - state key (line offset) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_LOCAL_EXPORT_ENV - state key (local export env) - serialized across the respawn/subshell boundary; see the owning subsystem
+// EXACT __RUBASH_LOGICAL_CWD - state key (logical cwd) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_LOGIN_SHELL - state key (login shell) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_LOWERCASE_VARS - serialized variable-name set (lowercase) for child/subshell state transfer
 // EXACT __RUBASH_NAMEREF_VARS - serialized variable-name set (nameref) for child/subshell state transfer
@@ -691,6 +709,8 @@ pub(crate) const HASH_ENV_FIELD_SEP: char = SUBSCRIPT_CARRIER;
 // EXACT __RUBASH_READONLY_FUNCTIONS - state key (readonly functions) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_READONLY_VARS - serialized variable-name set (readonly) for child/subshell state transfer
 // EXACT __RUBASH_READ_STDIN - state key (read stdin) - serialized across the respawn/subshell boundary; see the owning subsystem
+// EXACT __RUBASH_RESPAWN_PROOF - per-spawn fd/pipe provenance proof (rubash#3300): 32-hex-char nonce naming the proof pipe; consumed at child entry, never forwarded, never in FORK_TRANSPORT_KEYS — see init.rs respawn_proof_validated
+// EXACT __RUBASH_RESPAWN_PROOF_FD - per-spawn fd/pipe provenance proof (rubash#3300): fd number of the proof pipe read end (>= 100); consumed at child entry, never forwarded, never in FORK_TRANSPORT_KEYS — see init.rs respawn_proof_validated
 // EXACT __RUBASH_RETURN_TRAP_FUNCTION - state key (return trap function) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_SCRIPT_NAME - state key (script name) - serialized across the respawn/subshell boundary; see the owning subsystem
 // EXACT __RUBASH_SECONDS_OFFSET - state key (seconds offset) - serialized across the respawn/subshell boundary; see the owning subsystem
@@ -1088,6 +1108,12 @@ pub(crate) const MARKERS: &[MarkerInfo] = &[
         user_reachable: false,
     },
     MarkerInfo {
+        name: "SPLIT_ON_SPACES_SENTINEL",
+        code: SPLIT_ON_SPACES_SENTINEL as u32,
+        boundaries: &[],
+        user_reachable: false,
+    },
+    MarkerInfo {
         name: "GROUP_REDIRECT_INJECTED_MARK",
         code: 0x1E,
         boundaries: &[],
@@ -1337,8 +1363,38 @@ pub(crate) fn replace_ansi_c_ifs_guard(value: &str, replacement: &str) -> String
 }
 
 /// Drop bare ANSI_C_IFS_GUARD markers, preserving E400-escaped user U+E401.
+/// Whether the word carries a SPLIT_ON_SPACES_SENTINEL — the marker-lint
+/// reviewed contains-site (pair-aware: the sentinel is stripped, never
+/// dequoted as data, by `strip_split_on_spaces_sentinel`).
+pub(crate) fn contains_split_on_spaces_sentinel(value: &str) -> bool {
+    contains_bare_sentinel(value, SPLIT_ON_SPACES_SENTINEL)
+}
+
+/// Remove every SPLIT_ON_SPACES_SENTINEL (including E400-escaped pairs) —
+/// the marker is a word-level directive, never field data.
+pub(crate) fn strip_split_on_spaces_sentinel(value: &str) -> String {
+    restore_bare_sentinels(value, &[(SPLIT_ON_SPACES_SENTINEL, "")])
+}
+
 pub(crate) fn strip_ansi_c_ifs_guard(value: &str) -> String {
     replace_ansi_c_ifs_guard(value, "")
+}
+
+/// Decode transport word text to the literal characters a re-LEXER must
+/// see — the source-text boundary used by respawn rendering
+/// (`redirect_target_source_text`) and the here-document delimiter
+/// (`heredoc_delimiter_text`, rubash#1151): CTLESC pairs reduce to their
+/// data character, the DATA_*/ANSI-C quote carriers become what they
+/// denote, the `$name` terminator PARAM_NAME_END_MARKER is dropped (the
+/// re-lex regenerates it from the quoting), and the ANSI_C_IFS_GUARD
+/// field-split transport is stripped. Engine carriers are pre-expansion
+/// artifacts; transporting them into a child that re-parses the text
+/// made the child tag a protocol byte as literal data (rubash#3816).
+pub(crate) fn decode_transport_word_text(value: &str) -> String {
+    let decoded = decode_word_position_carriers(value);
+    let decoded = dequote_ctlesc_pairs(&decoded);
+    let decoded = decoded.replace(PARAM_NAME_END_MARKER, "");
+    strip_ansi_c_ifs_guard(&decoded)
 }
 
 /// Borrowing form of [`strip_ansi_c_ifs_guard`] for hot paths: a value with
@@ -1445,6 +1501,53 @@ pub(crate) fn decode_bare_sentinels(value: &str, rules: &[(char, &str)]) -> Stri
     while let Some(ch) = chars.next() {
         if ch == LITERAL_CHAR_ESCAPE {
             output.push(chars.next().unwrap_or(ch));
+            continue;
+        }
+        match rules.iter().find(|(sentinel, _)| *sentinel == ch) {
+            Some((_, replacement)) => output.push_str(replacement),
+            None => output.push(ch),
+        }
+    }
+    output
+}
+
+/// Decode-side sibling of [`decode_bare_sentinels`] for display strings
+/// that still cross the exactly-once marker decode (the array storage
+/// mirror's verbatim print path, rubash#3921): `E400 + c` resolves to
+/// `c` — EXCEPT when `c` is in the raw-byte marker range
+/// (U+E000..=U+E100), where the pair stays transport. A decoded lone
+/// U+E000 followed by a payload char re-forms a raw-byte pair, and the
+/// flush's decode then folds it to a byte (`a=($'\ue000\ue001')`
+/// printed NUL); keeping the pair lets the flush resolve it exactly
+/// once to the literal char. Pairs outside the range resolve here
+/// because the flush only decodes when U+E000 is present — a lone
+/// U+E314 left as `E400 + E314` would print the introducer verbatim.
+/// A decoded lone `E400` is safe at the flush: `E400` alone is emitted
+/// literally, and `E400` before the next pair's introducer resolves to
+/// the literal char (the flush decoder is pair-greedy).
+pub(crate) fn decode_bare_sentinels_keep_raw_byte_pairs(
+    value: &str,
+    rules: &[(char, &str)],
+) -> String {
+    if !value.contains(LITERAL_CHAR_ESCAPE)
+        && rules.iter().all(|(sentinel, _)| !value.contains(*sentinel))
+    {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE {
+            match chars.next() {
+                Some(next)
+                    if (RAW_BYTE_MARKER_ESCAPE..=RAW_BYTE_MARKER_LAST).contains(&(next as u32)) =>
+                {
+                    output.push(ch);
+                    output.push(next);
+                }
+                Some(next) => output.push(next),
+                None => output.push(ch),
+            }
             continue;
         }
         match rules.iter().find(|(sentinel, _)| *sentinel == ch) {
@@ -1800,10 +1903,14 @@ mod tests {
     /// must be removed (the staleness assert below enforces it).
     #[test]
     fn every_row_claims_boundaries_or_is_listed_internal() {
-        const INTERNAL_ONLY_ROWS: [&str; 6] = [
+        const INTERNAL_ONLY_ROWS: [&str; 7] = [
             // Parse-time site marker for ${...} quoting decisions;
             // consumed during parse, never enters stored/output text.
             "QUOTED_EXPANSION_SITE",
+            // Word-level W_SPLITSPACE port: consumed by the field
+            // splitter's charset override (or stripped on non-split
+            // paths); never stored or emitted.
+            "SPLIT_ON_SPACES_SENTINEL",
             // Prefix of the executor's group-redirect state string;
             // an internal state encoding read back by the same
             // subsystem, not a value/output carrier.

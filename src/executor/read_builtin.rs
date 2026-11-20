@@ -87,6 +87,9 @@ impl Executor {
         let mut stderr = Vec::new();
         let mut array_name = None;
         let mut delimiter = '\n';
+        // rubash#3944: a fresh `read` clears the `-d` word byte; only an
+        // option word this parse accepts re-arms it.
+        self.read_delim_word_byte = None;
         let mut char_limit = None;
         let mut exact_char_limit = false;
         let mut raw = false;
@@ -607,7 +610,7 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 "-n" => {
@@ -1300,13 +1303,13 @@ impl Executor {
                     delimiter = cmd
                         .words
                         .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
+                        .map(|word| self.read_delimiter_word(word))
                         .unwrap_or('\u{0}');
                     initial_text = cmd.words.get(index + 2).cloned();
                     index += 3;
                 }
                 word if word.starts_with("-edi") && word.len() > 4 => {
-                    delimiter = read_delimiter_char(&word[3..]);
+                    delimiter = self.read_delimiter_word(&word[3..]);
                     initial_text = Some(word[4..].to_string());
                     index += 1;
                 }
@@ -1314,13 +1317,13 @@ impl Executor {
                     delimiter = cmd
                         .words
                         .get(index + 1)
-                        .map(|word| read_delimiter_char(word))
+                        .map(|word| self.read_delimiter_word(word))
                         .unwrap_or('\u{0}');
                     initial_text = cmd.words.get(index + 2).cloned();
                     index += 3;
                 }
                 word if word.starts_with("-dei") && word.len() > 4 => {
-                    delimiter = read_delimiter_char(&word[3..]);
+                    delimiter = self.read_delimiter_word(&word[3..]);
                     initial_text = Some(word[4..].to_string());
                     index += 1;
                 }
@@ -1328,11 +1331,11 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-ed") && word.len() > 3 => {
-                    delimiter = read_delimiter_char(&word[3..]);
+                    delimiter = self.read_delimiter_word(&word[3..]);
                     index += 1;
                 }
                 "-red" | "-erd" => {
@@ -1340,14 +1343,14 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-red") || word.starts_with("-erd"))
                     && word.len() > 4 =>
                 {
                     raw = true;
-                    delimiter = read_delimiter_char(&word[4..]);
+                    delimiter = self.read_delimiter_word(&word[4..]);
                     index += 1;
                 }
                 "-st" => {
@@ -1436,11 +1439,11 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-sd") && word.len() > 3 => {
-                    delimiter = read_delimiter_char(&word[3..]);
+                    delimiter = self.read_delimiter_word(&word[3..]);
                     index += 1;
                 }
                 word if word.starts_with('-')
@@ -1453,7 +1456,7 @@ impl Executor {
                     index += 1;
                 }
                 word if word.starts_with("-d") && word.len() > 2 => {
-                    delimiter = read_delimiter_char(&word[2..]);
+                    delimiter = self.read_delimiter_word(&word[2..]);
                     index += 1;
                 }
                 "-rd" => {
@@ -1461,12 +1464,12 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 word if word.starts_with("-rd") && word.len() > 3 => {
                     raw = true;
-                    delimiter = read_delimiter_char(&word[3..]);
+                    delimiter = self.read_delimiter_word(&word[3..]);
                     index += 1;
                 }
                 "-rsd" | "-srd" => {
@@ -1474,14 +1477,14 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-rsd") || word.starts_with("-srd"))
                     && word.len() > 4 =>
                 {
                     raw = true;
-                    delimiter = read_delimiter_char(&word[4..]);
+                    delimiter = self.read_delimiter_word(&word[4..]);
                     index += 1;
                 }
                 "-ersd" | "-esrd" | "-resd" | "-rsed" | "-serd" | "-sred" => {
@@ -1489,7 +1492,7 @@ impl Executor {
                     let Some(delimiter_word) = cmd.words.get(index + 1) else {
                         return self.read_missing_argument(cmd, &mut stderr, 'd');
                     };
-                    delimiter = read_delimiter_char(delimiter_word);
+                    delimiter = self.read_delimiter_word(delimiter_word);
                     index += 2;
                 }
                 word if (word.starts_with("-ersd")
@@ -1501,7 +1504,7 @@ impl Executor {
                     && word.len() > 5 =>
                 {
                     raw = true;
-                    delimiter = read_delimiter_char(&word[5..]);
+                    delimiter = self.read_delimiter_word(&word[5..]);
                     index += 1;
                 }
                 "-rsn" | "-srn" => {
@@ -2954,6 +2957,7 @@ impl Executor {
                     self.read_deadline,
                     silent,
                     delimiter,
+                    self.read_delim_word_byte,
                     char_limit,
                     exact_char_limit,
                     poll_sigint,
@@ -3234,18 +3238,62 @@ impl Executor {
         // Materialized command-attached inputs carry their bytes
         // in-process (heredoc body, herestring/stdin string, function
         // stdin): the descriptor GNU would poll already holds them.
-        if cmd
-            .heredoc_redirects
-            .iter()
-            .any(|redirect| redirect.fd.unwrap_or(0) == fd && redirect.body.is_some())
-        {
+        if cmd.heredoc_redirects.iter().any(|redirect| {
+            redirect.fd.unwrap_or(0) == fd
+                && (redirect.body.is_some() || redirect.body_carrier.is_some())
+        }) {
             return 0;
         }
-        if fd == 0
-            && (self.stdin_string_for_command_mut(cmd).is_some()
-                || self.shell_state.env_vars.contains_key(FUNCTION_STDIN))
-        {
-            return 0;
+        if fd == 0 {
+            // rubash#3945: the fd-0 short-circuit used to consult
+            // stdin_string_for_command_mut, whose contract is
+            // CONSUMPTION — a staged FUNCTION_STDIN mirror advances its
+            // offset to the end and an exec-bound fd-0 File endpoint is
+            // slurped to EOF — so `read -t 0` blocked on a producer that
+            // had not written yet and ate the pending input, both faces
+            // GNU's read.def:395-398 early return forbids (it is
+            // input_avail(fd): a poll, never a read). Judge the
+            // in-process carriers without consuming:
+            // - a staged FUNCTION_STDIN buffer with a production
+            //   schedule (rubash#1141 pipeline staging) answers on the
+            //   schedule's virtual clock — bytes the producer has not
+            //   emitted yet are not available, however long the
+            //   materialization already waited; an unscheduled staged
+            //   buffer is a temp-file shape, always readable;
+            // - heredoc / here-string bodies are in-process text, the
+            //   same temp-file shape.
+            if self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
+                let staged_len = self
+                    .shell_state
+                    .env_vars
+                    .get(FUNCTION_STDIN)
+                    .map(|value| value.len())
+                    .unwrap_or(0);
+                let staged_offset = self
+                    .shell_state
+                    .env_vars
+                    .get(FUNCTION_STDIN_OFFSET)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let ready = self
+                    .timed_stdin
+                    .as_ref()
+                    .filter(|timing| timing.borrow().matches_len(staged_len))
+                    .map(|timing| timing.borrow().available_now(staged_offset))
+                    .unwrap_or(true);
+                return i32::from(!ready);
+            }
+            if cmd.heredoc.is_some()
+                || cmd.heredoc_body.is_some()
+                || cmd.here_string.is_some()
+                || cmd.here_string_carrier.is_some()
+                || cmd.heredoc_redirects.iter().any(|redirect| {
+                    redirect.fd.unwrap_or(0) == 0
+                        && (redirect.body.is_some() || redirect.body_carrier.is_some())
+                })
+            {
+                return 0;
+            }
         }
         if let Some(status) = self.read_timeout_zero_poll(fd) {
             return status;
@@ -3282,10 +3330,24 @@ impl Executor {
     /// no data is NOT available even though the fd is open, and a
     /// terminal reports ready only when the line discipline holds a
     /// complete line, so pending typeahead is neither consumed nor
-    /// misjudged. Text endpoints are materialized — always ready.
+    /// misjudged. Materialized text streams answer on their production
+    /// schedule when one rides them (rubash#3945), else they are
+    /// temp-file shapes — always ready.
     fn read_timeout_zero_poll(&self, fd: u32) -> Option<i32> {
         match self.fd_table.read_endpoint(fd) {
-            Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => Some(0),
+            // rubash#3945: a materialized text stream carrying a
+            // production schedule stands for GNU's live pipe (rubash#1141)
+            // — ready only once a byte past the stream offset has arrived
+            // on the schedule's virtual clock. An unscheduled stream is
+            // fully materialized (a temp-file shape) and always ready.
+            Some(endpoint @ (FdReadEndpoint::Text(_) | FdReadEndpoint::ProcessSubstitution(_))) => {
+                Some(
+                    endpoint
+                        .timed_text_stream_ready()
+                        .map(|ready| i32::from(!ready))
+                        .unwrap_or(0),
+                )
+            }
             Some(FdReadEndpoint::File(file)) => Some(read_timeout_zero_poll_handle(file.handle)),
             Some(FdReadEndpoint::CoprocStdout { fd, .. }) => {
                 Some(read_timeout_zero_poll_handle(fd.handle))
@@ -3435,6 +3497,17 @@ impl Executor {
             }
         }
         false
+    }
+
+    /// rubash#3944: accept one `-d` option word. GNU read.def:385 takes
+    /// the delimiter as the word's FIRST RAW BYTE (`delim = (unsigned
+    /// char)*list_optarg`) — record it beside the widened char, whose
+    /// own UTF-8 encoding starts with a different byte whenever the word
+    /// is a lone byte >= 0x80 (the scanners must key on the word's byte,
+    /// never the char's).
+    fn read_delimiter_word(&mut self, word: &str) -> char {
+        self.read_delim_word_byte = Some(super::read_helpers::read_delimiter_first_byte(word));
+        read_delimiter_char(word)
     }
 }
 

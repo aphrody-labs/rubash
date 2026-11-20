@@ -15,10 +15,7 @@ use crate::lexer::{Token, TokenKind};
 /// alone leaked the \023 name terminator into the warning text
 /// (rubash#1151, the same marker-leak family as #1029/#1060).
 pub(crate) fn heredoc_delimiter_text(value: &str) -> String {
-    let decoded = crate::executor::markers::decode_word_position_carriers(value);
-    let decoded = crate::executor::markers::dequote_ctlesc_pairs(&decoded);
-    let decoded = decoded.replace(crate::executor::markers::PARAM_NAME_END_MARKER, "");
-    crate::executor::markers::strip_ansi_c_ifs_guard(&decoded)
+    crate::executor::markers::decode_transport_word_text(value)
 }
 
 pub(super) fn collect_trailing_redirections(
@@ -1029,7 +1026,18 @@ pub(super) fn fill_pending_heredoc_body(
     redirect.body = Some(body.clone());
     redirect.gather_line = Some(gather_line);
     if redirect.fd.is_none() {
-        cmd.heredoc = Some(body);
+        // GNU redir.c REDIR_VARASSIGN (redir_varassign): a `{var}<<`
+        // body binds the freshly allocated descriptor, never fd 0, so
+        // it must not take the fd-0 stdin mirror (`cmd.heredoc`) — or
+        // every stdin consumer would feed it to the command as if it
+        // were a plain `<<` body (rubash#3894). The delimiter/gather/
+        // end-line fields below still record it: the EOF warning is
+        // about the gather, not fd 0, and GNU warns for `{var}<<` too.
+        // (Precedent: `{var}<<<` already skips the `here_string`
+        // mirror in assign_here_string_redirect_raw.)
+        if redirect.fd_var.is_none() {
+            cmd.heredoc = Some(body);
+        }
         // GNU stores the dequoted delimiter (`here_doc_eof = redir_word`),
         // so no carrier bytes may reach the warning text either.
         cmd.heredoc_delimiter = Some(heredoc_delimiter_text(&redirect.delimiter));

@@ -5,10 +5,11 @@
 pub(crate) mod arithmetic;
 pub(crate) mod glob;
 pub(crate) mod path;
+pub(crate) mod strmatch;
 pub(crate) mod types;
 pub(crate) mod wait_status;
 use arithmetic::{
-    arithmetic_division_by_zero_token, arithmetic_unbound_variable, eval_conditional_arith_value,
+    arithmetic_division_by_zero_token, eval_conditional_arith_value,
     eval_conditional_arith_value_categorized_with_writes,
     eval_conditional_arith_value_categorized_with_writes_and_state,
     eval_conditional_arith_value_with_writes,
@@ -102,7 +103,7 @@ mod init;
 pub(crate) use init::spawner_stamp_value;
 pub use init::{
     respawn_provenance_validated_from_process_env, FD_DELIVERY_AT_STAMPED_KEY, RESPAWNED_CHILD,
-    RESPAWN_SPAWNER_PID_KEY,
+    RESPAWN_PROOF_FD_KEY, RESPAWN_PROOF_KEY, RESPAWN_SPAWNER_PID_KEY,
 };
 pub mod profiler;
 // rubash#331: the binary crate renders its self-produced path values
@@ -256,6 +257,7 @@ pub(crate) use execution_misc::RandomGen;
 // own spawn faces (rubash#3148).
 use execution_misc::*;
 pub(crate) use external_inner::spawn_error_diagnostic;
+pub(crate) use external_inner::ChildCwdStamp;
 pub(crate) use external_inner::ChildFdSetup;
 // Shared with builtins::exec (rubash#3401 face 3): the simulated-exec
 // waits route through the executor's draining wait; the function lives
@@ -854,6 +856,20 @@ pub struct Executor {
     /// blocked in wait() for (GNU wait_for reaps background children
     /// while it blocks, jobs.c:3064 — an observation point).
     foreground_wait_count: Cell<u64>,
+    /// Count of wait_for-grade foreground blocks only: a real or
+    /// emulated forked child's wait. GNU's coproc disposal points are
+    /// the notify_and_cleanup inside wait_for (jobs.c:3385) and
+    /// stop_pipeline after a forked command — a blocking builtin
+    /// `read` is NOT one (rubash#2053), so it bumps
+    /// foreground_wait_count (publishing the reap records its SIGCHLD
+    /// window collected) but never this count. The retirement flush
+    /// in refresh_background_jobs keys on this count, so a pipe read
+    /// cannot retire a dead sibling coproc before the next command
+    /// expands its name (the named-coproc fd race).
+    disposal_wait_count: Cell<u64>,
+    /// disposal_wait_count as of the previous refresh_background_jobs
+    /// call; a disposal point has occurred when it moved.
+    disposal_prev_mark: Cell<u64>,
     coproc_stderr_forwarders: HashMap<u32, std::thread::JoinHandle<Result<(), std::io::Error>>>,
     /// rubash#1632: pipe writers displaced from a coproc child's stdout
     /// by the coproc command's own `>file`/`>>file` redirection, held for
@@ -997,6 +1013,17 @@ pub struct Executor {
     /// `command` arms; execute_exec snapshots and restores the fd state
     /// for its no-operand paths while it is non-zero.
     builtin_wrapper_depth: usize,
+    /// rubash#3917: non-zero while a compound command's redirect
+    /// bracket (with_command_input_redirects_scoped) is executing
+    /// its body. GNU runs such a body with the compound's
+    /// redirections applied and undoes them when the command
+    /// finishes (RX_UNDOABLE); this executor restores the fd TABLE
+    /// only, so a persistent `exec` inside the body must not place
+    /// files onto kernel descriptors — the placement would outlive
+    /// the bracket and corrupt the outer scope (PR #3930 review:
+    /// the issue3403 census regressions). Consulted by the
+    /// placement arming guard in execute_stdio_only_exec_redirect.
+    compound_redirect_scope_depth: usize,
     /// GNU `command -p` (builtins/command.def CDESC_STDPATH): the
     /// standard path for the re-dispatched command's OWN lookup only.
     /// Set for the duration of the re-dispatch and consulted by the
@@ -1637,6 +1664,67 @@ pub struct Executor {
     /// so the spawn-site read must use this pre-commit snapshot, not
     /// the live variable.
     pub(crate) exec_replace_shlvl_snapshot: Cell<Option<i64>>,
+    /// rubash#3932: nonzero while a GNU nofork-face spawn is armed on this
+    /// executor — the external spawn seam folds adjust_shell_level(-1)
+    /// into the child environment while it stands (GNU execute_cmd.c
+    /// 5813-5819: on the nofork path execute_disk_command decrements the
+    /// level and rebuilds the export environment before execve). Armed by
+    /// the user-subshell / command-substitution / process-substitution
+    /// body dispatch (execute_cmd.c:1756 optimize_subshell_command,
+    /// evalstring.c:532 should_suppress_fork in the forked child) and by
+    /// the async faces (execute_cmd.c:4553 in the forked async child,
+    /// :5562 for the wrapper respawn); consumed only as a spawn-time
+    /// predicate, restored by the walk frame that armed it.
+    pub(crate) nofork_spawn_dispatch_stamp: Cell<u64>,
+    /// rubash#3932: monotonic source for nofork_spawn_dispatch_stamp.
+    pub(crate) nofork_spawn_stamp_counter: Cell<u64>,
+    /// rubash#3932: one-shot pass letting an and_or_list's last element
+    /// keep the nofork spawn stamp across its execute_ast wrapper —
+    /// mirrors exec_replace_stamp_hold (GNU execute_cmd.c:2886
+    /// optimize_connection_fork marks the connection's second operand,
+    /// which this port dispatches through its own execute_ast walk).
+    pub(crate) nofork_spawn_stamp_hold: Cell<u32>,
+    /// rubash#3932: set by the paren/comsub/procsub body dispatch right
+    /// before its execute_ast call; execute_ast_inner consumes it for
+    /// that one walk (pending one-shot) so the walk's loop arms the spawn
+    /// stamp exactly at the body's last node — GNU marks the subshell
+    /// body's qualifying command before it dispatches
+    /// (execute_cmd.c:1799-1806), and an earlier body node's plain spawn
+    /// must take the forked face (live level), never the marked face.
+    pub(crate) nofork_spawn_body_candidate_pending: Cell<bool>,
+    /// rubash#3932: the consumed candidate flag for the walk in flight
+    /// (see nofork_spawn_body_candidate_pending).
+    pub(crate) nofork_spawn_body_candidate: Cell<bool>,
+    /// rubash#3932: whether the armed face admits command redirects —
+    /// false for the paren/comsub faces (should_optimize_fork's
+    /// redirects==0 arm, evalstring.c:106-117 with subshell==0) and true
+    /// for the procsub face (should_suppress_fork passes the PROCSUB
+    /// bit, which relaxes the redirect check) and the async faces
+    /// (execute_cmd.c:4553 sets CMD_NO_FORK unconditionally).
+    pub(crate) nofork_spawn_face_allows_redirects: Cell<bool>,
+    /// rubash#3932: true for the async faces — GNU's forked async child
+    /// marks CMD_NO_FORK without consulting should_optimize_fork
+    /// (execute_cmd.c:4553), so a parent-set EXIT/ERR trap must not
+    /// block the seam adjustment (a parent `trap 'true' EXIT` with
+    /// `printenv & wait` still exports live-1).
+    pub(crate) nofork_spawn_face_unconditional: Cell<bool>,
+    /// rubash#3932: the payload face a validated respawn transports for
+    /// its `-c` body (Executor::new consumes BACKGROUND_WRAPPER_PAYLOAD_
+    /// FACE_KEY under the internal-respawn provenance gate): 0 none,
+    /// 1 simple (the forked async child's unconditional mark,
+    /// execute_cmd.c:4553), 2 subshell body (the paren-face replay,
+    /// execute_cmd.c:1799-1806, trap-gated + redirects block),
+    /// 3 process-substitution body (should_suppress_fork with the
+    /// PROCSUB bit, evalstring.c:106-117 — trap-gated, redirects ride).
+    /// The -c arming consults it; a forged ambient key arms nothing
+    /// (consumed only for a validated internal respawn, then stripped).
+    pub(crate) respawn_payload_face: Cell<u8>,
+    /// rubash#3932: true for the input-process-substitution face — the
+    /// body runs IN-PROCESS on this executor (GNU forks a child whose
+    /// trap table was reset, trap.c reset_or_restore_signal_handlers),
+    /// so the seam gate evaluates against the reset-child shape
+    /// (parent-set traps invisible) instead of the live table.
+    pub(crate) nofork_spawn_face_child_trap_reset: Cell<bool>,
     /// rubash#353: locale in effect when each SOURCE LINE was first reached
     /// at reader level — the locale GNU's parser would decode that line's
     /// `$'...'` backslash-u escapes under (GNU reads a newline-terminated
@@ -1896,6 +1984,46 @@ pub struct Executor {
     /// pre-existing file still fails in the prepare phase itself, and
     /// simple commands never consult the set.
     pub(crate) noclobber_prepared_targets: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// rubash#3828: redirect targets an earlier walk already opened,
+    /// retained by redirect-list position so the bind walk adopts the
+    /// entry's ONE open instead of re-opening the path. GNU
+    /// do_redirections opens each redirect entry exactly once
+    /// (redir.c do_redirection_internal -> redir_open); rubash splits
+    /// that open across a validate/prepare walk and a bind walk, so
+    /// the first walk's File is carried here keyed by
+    /// `cmd.redirects` position. The tuple's String is the expanded
+    /// target the producing walk saw — a consumer adopts only on an
+    /// exact match, so a stale entry can never bind the wrong file.
+    pub(crate) pending_preopened_redirects: std::cell::RefCell<
+        std::collections::HashMap<
+            usize,
+            (String, std::rc::Rc<crate::executor::fd_table::FileFd>, u64),
+        >,
+    >,
+    /// rubash#3875: one-shot — this executor is a pipeline builtin
+    /// stage's subshell and was handed the stage command's parked
+    /// preopened handles (the parent executor's reject/stage gates
+    /// already performed those entries' ONE open). The subshell's
+    /// first reject gate keeps the parked entries instead of clearing
+    /// them, so its probe and bind walks adopt the handles rather
+    /// than re-opening a target the first open created without
+    /// owner-write (umask masking 0200), which fails EACCES.
+    pub(crate) preopened_pending_preserved_once: std::cell::Cell<bool>,
+    /// rubash#3875: the pending channel's scoping generation. Every
+    /// parked handle is stamped with the generation current when it
+    /// was parked (see store_pending_preopened); the stamp advances
+    /// once per command dispatch (execute_command) and once per
+    /// pipeline element routing (route_pipeline_stage_streams), and
+    /// the reject gate retires handles stamped by an older
+    /// generation. A handle therefore lives only within the command
+    /// (or pipeline element) whose walks parked it: that command's
+    /// preparatory walks — compound prepare, pipeline admission
+    /// probes, the output gates — all run inside one generation,
+    /// while a previous command's leftovers can never be adopted by
+    /// a later command whose redirect list happens to coincide in
+    /// position and target text (the cross-command stale-handle
+    /// binds: a shared offset and no fresh truncate).
+    pub(crate) preopened_generation: std::cell::Cell<u64>,
     /// The group's execute_ast ended by unwinding (`exit`, errexit, POSIX
     /// special-builtin failure, fatal expansion — GNU's
     /// jump_to_top_level(EXITPROG/ERREXIT/FORCE_EOF)). run_source converts
@@ -2213,6 +2341,14 @@ pub struct Executor {
     /// set only by read_inherited_process_stdin's EOF-with-nothing
     /// return, never by a timeout/interrupt break.
     pub(crate) read_process_stdin_eof: bool,
+    /// rubash#3944: the `-d` option word's FIRST RAW BYTE (read.def:385
+    /// `delim = (unsigned char)*list_optarg`). The delimiter char widened
+    /// from a byte word (`-d $'\351'`, `-d $'\377'`) is indistinguishable
+    /// from the same typed Latin-1 character, whose UTF-8 encoding starts
+    /// with a DIFFERENT byte — the record scanners key on the word's byte,
+    /// never on the char's encoding. `None` unless `-d` was given (a
+    /// fresh `read` clears it beside the `delimiter` init).
+    pub(crate) read_delim_word_byte: Option<u8>,
     /// rubash#2339: `read -e`/`-E` was given (builtins/read.def:321-328:
     /// both set `edit`; -E adds bash's completion flavor). Derived from
     /// the option words in execute_read beside the `silent` derivation
