@@ -2550,10 +2550,11 @@ impl Executor {
             return;
         }
 
-        // rubash#1632: the displaced stdout writer's lifetime ends with
-        // the coproc (on Unix the child's own copy already died with
-        // it; this drops the parent-held copy where one was kept).
-        self.coproc_displaced_stdout_writers.remove(&pid);
+        // rubash#4008: the displaced stdout writer's lifetime already
+        // ended with the child — it rode a save-slot fd into the child
+        // (Unix) or a detached waiter dropped it at the child's exit
+        // (other hosts), matching GNU's child-held save fd. Nothing to
+        // settle here.
         self.close_coproc_endpoints(pid);
 
         let endpoint_fds = self
@@ -6082,6 +6083,22 @@ impl Executor {
                 }
             } else {
                 values.extend(self.expand_shellexp_word_values_result(&word)?);
+                // rubash#3969: a brace product's unclosed backquote is the
+                // same expand_word_error that abandons
+                // gen_wordlist_matches' expansion in GNU — the diagnostic
+                // already printed and the rest of the command list is
+                // DISCARDed (`compgen -W "{a..A}x"; echo after` never
+                // runs `echo`), not a truncated success. Consume the
+                // latch and arm the reader-level abort so it cannot leak
+                // into the next command.
+                if self.shell_state.parameter_bad_substitution.replace(false) {
+                    self.shell_state.bad_substitution_reported.set(false);
+                    self.shell_state.bad_substitution_discard_only.set(false);
+                    self.raise_evalerror_abort();
+                    self.command_expansion_failed.set(true);
+                    self.exit_code = 1;
+                    return Ok(Vec::new());
+                }
             }
         }
         Ok(values)

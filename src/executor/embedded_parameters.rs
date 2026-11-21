@@ -199,6 +199,10 @@ impl Executor {
         // Snapshot the expansion-verdict latches; a false→true transition
         // inside the walk is the walk's own failure verdict.
         let bad_sub_before = self.shell_state.parameter_bad_substitution.replace(false);
+        let bad_sub_discard_before = self
+            .shell_state
+            .bad_substitution_discard_only
+            .replace(false);
         // rubash#3499: the print budget rides with the verdict — the walk
         // is a read-side render, so a diagnostic it prints must not spend
         // the enclosing command's one report, and a report the enclosing
@@ -248,6 +252,9 @@ impl Executor {
         self.shell_state
             .bad_substitution_reported
             .set(bad_sub_reported_before);
+        self.shell_state
+            .bad_substitution_discard_only
+            .set(bad_sub_discard_before);
         EXPAND_DEPTH.with(|d| d.set(depth));
         if failed {
             return word.to_string();
@@ -386,7 +393,18 @@ impl Executor {
                 quoted_site = true;
                 continue;
             }
-            if protect_ifs && in_double && matches!(ch, ' ' | '\t' | '\n') {
+            // GNU expand_word_internal's quoted-character path
+            // (subst.c:11639-11673) CTLESC-protects EVERY character of a
+            // quoted span, not only whitespace: a non-blank IFS char
+            // inside "..." of an unquoted rhs (`${w:-"a:b"}` under
+            // IFS=': ') is quoted data and must not field-split
+            // (rubash#4003). `$ ` " \ stay live syntax — the arms below
+            // must still see them, so they are excluded here.
+            if protect_ifs
+                && in_double
+                && (matches!(ch, ' ' | '\t' | '\n')
+                    || (self.current_ifs().contains(ch) && !matches!(ch, '$' | '`' | '\\' | '"')))
+            {
                 output.push(crate::executor::markers::IFS_GLUE);
                 output.push(ch);
                 continue;
@@ -560,6 +578,9 @@ impl Executor {
                         }
                         Some('"') => {
                             chars.next();
+                            if self.current_ifs().contains('"') {
+                                output.push(crate::executor::markers::IFS_GLUE);
+                            }
                             output.push('"');
                             continue;
                         }
@@ -570,6 +591,9 @@ impl Executor {
                         }
                         Some('\'') if !in_double => {
                             chars.next();
+                            if self.current_ifs().contains('\'') {
+                                output.push(crate::executor::markers::IFS_GLUE);
+                            }
                             output.push('\'');
                             continue;
                         }
@@ -589,7 +613,11 @@ impl Executor {
                         Some(other) if in_double => {
                             chars.next();
                             output.push(crate::executor::markers::ASSIGN_EXPANSION_BACKSLASH);
-                            if matches!(other, ' ' | '\t') {
+                            // `\`+c inside "..." is literal data in GNU
+                            // (both bytes CTLESC-protected), so a non-
+                            // blank IFS char keeps its split protection
+                            // exactly like the quoted-span chars above.
+                            if matches!(other, ' ' | '\t') || self.current_ifs().contains(other) {
                                 output.push(crate::executor::markers::IFS_GLUE);
                             }
                             output.push(other);
@@ -647,7 +675,16 @@ impl Executor {
                     if quoted_ch == '\'' {
                         break;
                     }
-                    if protect_ifs && matches!(quoted_ch, ' ' | '\t' | '\n') {
+                    // Every char of a '...' span is CTLESC-protected
+                    // literal data in GNU (subst.c:11882-11886
+                    // add_quoted_string), so ANY IFS char — not only
+                    // whitespace — keeps its split protection
+                    // (rubash#4003: `${w:-'a:b'}` under IFS=': ' splits
+                    // to `a` `b` in redirect position without it).
+                    if protect_ifs
+                        && (matches!(quoted_ch, ' ' | '\t' | '\n')
+                            || self.current_ifs().contains(quoted_ch))
+                    {
                         output.push(crate::executor::markers::IFS_GLUE);
                     }
                     // rubash#2216: single-quoted content is data (GNU
