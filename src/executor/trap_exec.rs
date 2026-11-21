@@ -4747,8 +4747,8 @@ impl Executor {
         // redirection_error), the command is not exec'd, and the shell
         // continues at status 1 (GNU exec.def exec_builtin: a failed
         // do_redirections returns before the execve).
-        if let Some((index, name)) = self.compound_dup_bad_fd(cmd) {
-            self.abandon_compound_for_dup_bad_fd::<()>(cmd, index, &name)?;
+        if let Some((index, name, cannot_duplicate)) = self.compound_dup_bad_fd(cmd) {
+            self.abandon_compound_for_dup_bad_fd::<()>(cmd, index, &name, cannot_duplicate)?;
             return Ok(1);
         }
         // `<&N` dups and numbered input redirects are real descriptor
@@ -6106,6 +6106,9 @@ impl Executor {
             if *fd < 3 || entry.closed {
                 continue;
             }
+            if self.fd_is_walk_save_slot(*fd) {
+                continue;
+            }
             match self.ambient_procsub_spawn_fd(*fd) {
                 super::external_setup::ProcsubSpawnFd::File { read, write } => {
                     if let Some(file) = &read {
@@ -6185,7 +6188,43 @@ impl Executor {
                         ambient_pins.push((dup, *fd));
                     }
                 }
-                _ => {}
+                // rubash#3997: a symbolic device write endpoint has no
+                // handle for ambient_procsub_spawn_fd to return — it
+                // resolves Inherit and the slot would drop. Materialize
+                // the device for the respawned child exactly like the
+                // File arms: env transport for a rubash child, the
+                // inheritable dup's pin for a foreign one (the
+                // exec_spawn_table_binding FullDevice precedent,
+                // rubash#3985).
+                _ => {
+                    if matches!(
+                        self.fd_table.write_endpoint(*fd),
+                        Some(FdWriteEndpoint::FullDevice)
+                    ) {
+                        if let Some(file) =
+                            crate::executor::external_redirects::open_spawn_full_device(
+                                "/dev/full",
+                                false,
+                            )
+                        {
+                            let handle = crate::fd::into_handle(file);
+                            if let Ok(dup) = crate::fd::duplicate_handle_inheritable(handle) {
+                                env_entries.push((
+                                    format!("__RUBASH_FD_WHANDLE_{fd}"),
+                                    format!("{dup:#x}"),
+                                ));
+                                env_entries.push((
+                                    format!("__RUBASH_FD_WPATH_{fd}"),
+                                    "/dev/full".to_string(),
+                                ));
+                                ambient_fd_dups.push(dup);
+                                #[cfg(unix)]
+                                ambient_pins.push((dup, *fd));
+                            }
+                            crate::fd::close_handle(handle);
+                        }
+                    }
+                }
             }
         }
         // rubash#3300: the parent's proof copy closes with the other
@@ -6216,7 +6255,7 @@ impl Executor {
             let pins = ambient_pins;
             unsafe {
                 child.pre_exec(move || {
-                    super::external_inner::pin_ambient_fds_in_child(&pins).map(|_| ())
+                    super::external_inner::pin_ambient_fds_in_child(&pins, &[]).map(|_| ())
                 });
             }
         }
@@ -6528,7 +6567,16 @@ impl Executor {
                         !current.closed && (current.read.is_some() || current.write.is_some())
                     });
                     if !occupied_now {
-                        if let Some(entry) = self.fd_table.saved_entry(source)? {
+                        // rubash#4024: the save is a REAL descriptor
+                        // (FdTable::exec_walk_saved_entry) — a stdio
+                        // marker cloned as the symbolic alias would die
+                        // with the redirector's own close, and the
+                        // dup-back would bind a dead endpoint.
+                        if let Some(entry) = self.fd_table.exec_walk_saved_entry(
+                            source,
+                            self.stdout_marker_names_process(source),
+                            self.stderr_capture.is_none(),
+                        )? {
                             if !entry.closed && (entry.read.is_some() || entry.write.is_some()) {
                                 self.fd_table.entries.insert(slot, entry.clone());
                                 inserted_saves.push((slot, entry));
@@ -7665,6 +7713,28 @@ impl Executor {
         }
     }
 
+    /// rubash#4024: whether an `FdWriteEndpoint::Stdout` marker bound
+    /// at `source` resolves to the process stdout descriptor — the
+    /// same answer write_fd_endpoint gives (shell_options.rs): a
+    /// dup2-snapshot record of `None` froze the fd to the real stdout
+    /// (rubash#368); an absent record is the live alias, which names
+    /// the kernel descriptor only while no capture or pipeline stream
+    /// holds it. When false the marker names a capture no descriptor
+    /// dup can carry, and the exec walk's undo save keeps its
+    /// symbolic form.
+    fn stdout_marker_names_process(&self, source: u32) -> bool {
+        if source == 1 && crate::executor::shell_options::active_capture_stream().is_some() {
+            return false;
+        }
+        match self.fd_table.stdout_alias_generation.get(&source) {
+            Some(record) => record.is_none(),
+            None => {
+                !crate::executor::shell_options::stdout_capture_active()
+                    && self.stdout_capture.is_none()
+            }
+        }
+    }
+
     fn copy_persistent_output_fd(&mut self, target_fd: u32, source_fd: u32) {
         // GNU dup2 semantics: `N>&M` copies the whole descriptor — a
         // read-only source (`exec 0>&3`) also installs the read side.
@@ -8775,6 +8845,53 @@ impl Executor {
         saves
     }
 
+    /// rubash#3999: the descriptor space `cmd`'s own list evolves
+    /// through position `before` — the walk in_list_save_open
+    /// mirrors, factored out so the read builtin's serve and
+    /// availability machinery resolves the same bindings (list
+    /// entries AND the undo saves earlier entries earned through
+    /// fd_walk_register_saves, the #3998 registry; GNU's saves are
+    /// real descriptors in the one walk space, add_undo_redirect
+    /// redir.c:1296). Slots the list never touched are absent:
+    /// callers resolve those against the ambient fd table.
+    fn in_list_walk_space(&self, cmd: &CommandNode, before: usize) -> FdWalkSpace {
+        let mut walk = FdWalkSpace::new();
+        let mut occupied_slots: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for redirect in cmd.redirects.iter().take(before) {
+            if let Some(entry_fd) = redirect.fd {
+                occupied_slots.insert(entry_fd);
+            }
+            if redirect.fd_var.is_none() {
+                for (slot, _source) in
+                    self.fd_walk_register_saves(&mut walk, redirect, &occupied_slots)
+                {
+                    occupied_slots.insert(slot);
+                }
+                self.fd_walk_record_fixed_entry(&mut walk, redirect);
+            }
+        }
+        walk
+    }
+
+    /// rubash#3999: the binding `fd` holds at list position `before`
+    /// in `cmd`'s own redirect list, in the walk's currency — a save
+    /// slot an earlier entry earned, or a binding an earlier entry
+    /// recorded. None when no entry before `before` touches fd: the
+    /// ambient fd table then governs. Same undoable-walk gate as
+    /// in_list_save_open — a subshell head or a pipeline element is
+    /// the fork child's RX_ACTIVE pass and earns no saves.
+    pub(in crate::executor) fn in_list_walk_binding(
+        &self,
+        cmd: &CommandNode,
+        before: usize,
+        fd: u32,
+    ) -> Option<FdWalkBinding> {
+        if cmd.subshell_command.is_some() || cmd.pipe.is_some() || cmd.pipeline_command.is_some() {
+            return None;
+        }
+        self.in_list_walk_space(cmd, before).get(&fd).cloned()
+    }
+
     /// rubash#3991: whether `fd` names a live descriptor recorded
     /// in `cmd`'s walk at list position `before` — in particular an
     /// undo save earned by an entry before that position (see
@@ -8794,23 +8911,8 @@ impl Executor {
         if cmd.subshell_command.is_some() || cmd.pipe.is_some() || cmd.pipeline_command.is_some() {
             return false;
         }
-        let mut walk = FdWalkSpace::new();
-        let mut occupied_slots: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for redirect in cmd.redirects.iter().take(before) {
-            if let Some(entry_fd) = redirect.fd {
-                occupied_slots.insert(entry_fd);
-            }
-            if redirect.fd_var.is_none() {
-                for (slot, _source) in
-                    self.fd_walk_register_saves(&mut walk, redirect, &occupied_slots)
-                {
-                    occupied_slots.insert(slot);
-                }
-                self.fd_walk_record_fixed_entry(&mut walk, redirect);
-            }
-        }
         matches!(
-            walk.get(&fd),
+            self.in_list_walk_space(cmd, before).get(&fd),
             Some(FdWalkBinding::TableSlot(_) | FdWalkBinding::File(_))
         )
     }

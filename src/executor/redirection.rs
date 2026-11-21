@@ -1153,36 +1153,65 @@ impl Executor {
                     continue;
                 }
                 // Digit forms `&N` / `&N-` (possibly via expansion).
-                if let Some((fd, move_fd)) = redirect_target_fd_and_move(&target) {
-                    // GNU redir.c do_redirection_internal guards the
-                    // whole dup/move apply with `redir_fd != redirector`:
-                    // a self-dup/self-move never reaches the dup2, so it
-                    // succeeds even when the fd is closed, and a self-move
-                    // does not close anything (rubash#1236). It also
-                    // changes nothing, so the opened bookkeeping is left
-                    // exactly as it was (a closed fd stays closed for a
-                    // later dup in the same list).
-                    if fd == redirector {
+                let dup_target = redirect_target_fd_and_move(&target);
+                // Move-ness is a parse-time property of the RAW word
+                // (make_cmd.c:704-716 strips a trailing '-' before the
+                // word ever expands): a dash the expansion alone
+                // produced (`8>&$x` with x=10-) leaves
+                // r_duplicating_output_word, whose expanded `10-` fails
+                // all_digits and is AMBIGUOUS_REDIRECT — it is not a
+                // move and must fall through to the word-form rules.
+                let raw_move = raw_word.ends_with('-');
+                let expanded_move_only =
+                    dup_target.is_some_and(|(_, expanded_move)| expanded_move) && !raw_move;
+                if !expanded_move_only {
+                    if let Some((fd, _expanded_move)) = dup_target {
+                        let move_fd = raw_move;
+                        // GNU redir.c do_redirection_internal guards the
+                        // whole dup/move apply with `redir_fd != redirector`:
+                        // a self-dup/self-move never reaches the dup2, so it
+                        // succeeds even when the fd is closed, and a self-move
+                        // does not close anything (rubash#1236). It also
+                        // changes nothing, so the opened bookkeeping is left
+                        // exactly as it was (a closed fd stays closed for a
+                        // later dup in the same list).
+                        if fd == redirector {
+                            continue;
+                        }
+                        if !dup_source_fd_open(&self.fd_table, fd, &opened) {
+                            // redir.c:1171-1175: the move's source-close
+                            // undo save — whose failed fcntl prints the
+                            // `cannot duplicate fd` line — runs only on an
+                            // RX_UNDOABLE walk whose redirector is open at
+                            // this position.
+                            let cannot_duplicate = move_fd
+                                && self.output_walk_is_undoable(cmd)
+                                && dup_source_fd_open(&self.fd_table, redirector, &opened);
+                            return self
+                                .reject_with_dup_bad_fd(
+                                    cmd,
+                                    index,
+                                    fd,
+                                    cannot_duplicate,
+                                    raw_word,
+                                    redirector,
+                                )
+                                .map(|_| Some(RedirectRejection::Command));
+                        }
+                        // The dup itself succeeds (GNU dup2 at redir.c:1153);
+                        // the command-scoped application sites own the binding
+                        // and the move's close.
+                        opened.insert(redirector, true);
+                        opened_socket.insert(
+                            redirector,
+                            scan_endpoint_is_socket(self, fd, &opened_socket),
+                        );
+                        if move_fd {
+                            opened.insert(fd, false);
+                            opened_socket.insert(fd, false);
+                        }
                         continue;
                     }
-                    if !dup_source_fd_open(&self.fd_table, fd, &opened) {
-                        return self
-                            .reject_with_dup_bad_fd(cmd, index, fd, move_fd, raw_word, redirector)
-                            .map(|_| Some(RedirectRejection::Command));
-                    }
-                    // The dup itself succeeds (GNU dup2 at redir.c:1153);
-                    // the command-scoped application sites own the binding
-                    // and the move's close.
-                    opened.insert(redirector, true);
-                    opened_socket.insert(
-                        redirector,
-                        scan_endpoint_is_socket(self, fd, &opened_socket),
-                    );
-                    if move_fd {
-                        opened.insert(fd, false);
-                        opened_socket.insert(fd, false);
-                    }
-                    continue;
                 }
                 // Word forms (redir.c:784-843 TRANSLATE_REDIRECT).
                 // Zero-field expansion → redirection_expand NULL →
@@ -1810,24 +1839,33 @@ impl Executor {
     }
 
     /// The dup bad-fd rejection. GNU `>&7-`/`<&7-` with fd 7 closed fails
-    /// in TWO steps (verified against WSL GNU 5.3.0, rubash#263/#266):
-    /// redir.c:1137-1143's add_undo_redirect of the moved fd sys_errors
-    /// `script: redirection error: cannot duplicate fd: ...` (error.c
-    /// get_name_for_error prolog, no line segment), then
+    /// in TWO steps when the walk is undoable AND the move's redirector
+    /// is open (verified against WSL GNU 5.3.x, rubash#263/#266/#4028):
+    /// redir.c:1171-1175's second add_undo_redirect of the moved SOURCE
+    /// fd sys_errors `script: redirection error: cannot duplicate fd:
+    /// ...` (error.c get_name_for_error prolog, no line segment) — its
+    /// fcntl(F_DUPFD) fails EBADF on the closed source — then
     /// REDIRECTION_ERROR returns EBADF and redirection_error
-    /// (redir.c:149-158) prints the fd with the full prefix. Plain dups
-    /// (`>&7`, redir.c:1153 dup2) report only the second line.
+    /// (redir.c:149-158) prints the fd with the full prefix. The save
+    /// is gated on `fcntl(redirector, F_GETFD)` (redir.c:1173), so a
+    /// closed redirector or an RX_ACTIVE-only walk (forked child,
+    /// pipeline stage, subshell head — no undo list exists,
+    /// execute_cmd.c:5522/1761) reports only the second line, and a
+    /// plain dup (`>&7`, redir.c:1215 dup2) never earns the first.
+    /// `cannot_duplicate` carries that whole verdict from the caller,
+    /// which owns the walk's undoable classification and the
+    /// redirector's at-position openness.
     fn reject_with_dup_bad_fd(
         &mut self,
         cmd: &CommandNode,
         index: usize,
         fd: u32,
-        move_fd: bool,
+        cannot_duplicate: bool,
         raw_word: &str,
         redirector: u32,
     ) -> Result<(), ExecuteError> {
         let mut stderr = Vec::new();
-        if move_fd {
+        if cannot_duplicate {
             writeln!(
                 &mut stderr,
                 "{}redirection error: cannot duplicate fd: Bad file descriptor",
@@ -1846,6 +1884,43 @@ impl Executor {
         self.write_redirect_diagnostic_at(cmd, index, &stderr)?;
         self.exit_code = 1;
         Ok(())
+    }
+
+    /// Whether `cmd`'s redirect list is applied with GNU's RX_UNDOABLE
+    /// saves — the only walks where add_undo_redirect (redir.c:1296)
+    /// runs and can sys_error `redirection error: cannot duplicate fd`
+    /// (rubash#4028). RX_ACTIVE-only applications register no undo list
+    /// at all, so a failing move reports only the `N: Bad file
+    /// descriptor` line:
+    /// - pipeline elements are the fork child's pass
+    ///   (execute_cmd.c:5522; the stage node carries `.pipe`),
+    /// - a `( )` subshell head's own list is execute_in_subshell's
+    ///   RX_ACTIVE pass (execute_cmd.c:1761),
+    /// - the respawned async-simple body replays that same forked
+    ///   child face (its payload face is `simple`),
+    /// - disk/external commands apply redirects in the forked child
+    ///   (execute_cmd.c:5884) — classified by the effective command
+    ///   word exactly like command_word_runs_in_current_shell.
+    /// Everything else — builtins, functions, `exec`, null commands,
+    /// arithmetic/conditional commands — runs do_redirections with
+    /// RX_UNDOABLE in the current shell (execute_cmd.c:854/4268/5606).
+    fn output_walk_is_undoable(&self, cmd: &CommandNode) -> bool {
+        if cmd.pipe.is_some() || cmd.pipeline_command.is_some() || cmd.subshell_command.is_some() {
+            return false;
+        }
+        if self.respawn_payload_face.get() == 1 {
+            return false;
+        }
+        if cmd.arithmetic_command.is_some() || cmd.conditional_command.is_some() {
+            return true;
+        }
+        match Self::effective_command_word(&cmd.words) {
+            // execute_null_command applies a wordless command's
+            // redirections in the current shell, undoable
+            // (execute_cmd.c:4203-4278).
+            None => true,
+            Some(word) => self.command_word_runs_in_current_shell(word),
+        }
     }
 
     fn reject_redirect_at(
@@ -2931,6 +3006,20 @@ impl Executor {
         // records the entry as the walk passes it.
         let mut route_walk = super::trap_exec::FdWalkSpace::new();
         let mut route_occupied: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // rubash#4027: the fds an earlier entry's undo save will
+        // restore after this walk — the `source` of every
+        // add_undo_redirect the registration below records. GNU
+        // replays the whole undo chain at command end
+        // (cleanup_redirects, execute_cmd.c:507 → do_redirections on
+        // redirection_undo_list), so a move's unpersistable close —
+        // no save of its own when the target was closed
+        // (redir.c:1169-1177) — still leaves fd N open when an
+        // EARLIER entry saved it: `echo a 9>other.txt 8>&9-` with fd
+        // 9 ambient ends with fd 9 restored to its pre-list binding,
+        // not closed. Populated only on undoable_walks; an RX_ACTIVE
+        // walk earns no saves at all.
+        let mut walk_restored_fds: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
         for (index, redirect) in cmd.redirects.iter().enumerate() {
             if let Some(fd) = redirect.fd {
                 route_occupied.insert(fd);
@@ -2952,6 +3041,7 @@ impl Executor {
                         self.fd_walk_register_saves(&mut route_walk, redirect, &route_occupied)
                     {
                         route_occupied.insert(slot);
+                        walk_restored_fds.insert(source);
                         if let Some(target) = self.walk_dup_source_target(state, source) {
                             let target = match (source, target) {
                                 (1, OutputTarget::Stdout) => OutputTarget::ProcessStdout,
@@ -3452,7 +3542,23 @@ impl Executor {
                             state.fds.insert(source_fd, OutputTarget::Closed);
                             state.list_binds.insert(source_fd, ListBound::Closed);
                             state.shared_with.remove(&source_fd);
-                            if state.persist_move_closes && !target_was_open {
+                            // rubash#4027: the rubash#1235 persist
+                            // close applies only when NO undo record
+                            // will restore the source — i.e. the
+                            // target was closed at apply time (so the
+                            // move itself registers no save,
+                            // redir.c:1169-1177) AND no earlier entry
+                            // of this list saved the source
+                            // (add_undo_redirect, redir.c:1296; e.g.
+                            // `9>other.txt` before `8>&9-`). With a
+                            // save pending, GNU's undo replay puts
+                            // the pre-list binding back; persisting
+                            // the close here left later `>&N` writes
+                            // failing EBADF.
+                            if state.persist_move_closes
+                                && !target_was_open
+                                && !walk_restored_fds.contains(&source_fd)
+                            {
                                 self.close_persistent_output_fd(source_fd)?;
                                 self.shell_state
                                     .env_vars
@@ -5129,24 +5235,36 @@ pub(in crate::executor) fn dup_source_fd_open(
     }
 }
 
-/// GNU redir.c:149-176 redirection_error EBADF filename: a pure-digit
-/// source operand came through the NUMBER grammar (`>&7` →
-/// r_duplicating_output → itos(redirectee.dest)); every other source is a
-/// dup-WORD instruction — redirectors 0/1 report the operand word as
-/// written (make_redirection's dash strip at make_cmd.c:709-710 mutates
-/// `7-` to `7` first), other redirectors report itos(redirector).
-/// `fallback` stands in for the dest when no fd parsed (dest -1).
+/// GNU redir.c:149-176 redirection_error EBADF filename. The naming
+/// follows the redirect's INSTRUCTION, and the TRANSLATE_REDIRECT
+/// overwrite touches flags/rflags only (redir.c:891-894) — the
+/// instruction redirection_error's switch sees is the one the parser
+/// built:
+/// - NUMBER instructions (`N>&M` / `N>&M-` literal digits —
+///   r_duplicating_input/output, r_move_input/output) name the SOURCE
+///   fd: `itos(redirectee.dest)` (redir.c:157-162). `fallback` carries
+///   that dest (the parsed source; -1 cases pass the redirector).
+/// - r_move_*_word hits `default` → `itos(redirector.dest)` for EVERY
+///   redirector, 0/1 included (a word move never reaches the
+///   r_duplicating_*_word arms).
+/// - r_duplicating_*_word names the operand word at redirectors 0/1
+///   and `itos(redirector.dest)` otherwise (redir.c:163-176).
+/// `raw_word` is the unexpanded target with any `&` marker and no
+/// dash stripping: a trailing `-` is what make_cmd.c:704-716 turned
+/// into the move family, so it selects the word-move naming arm.
 pub(in crate::executor) fn dup_bad_fd_name(
     raw_word: &str,
     redirector: u32,
     fallback: u32,
 ) -> String {
     let base = raw_word.strip_suffix('-').unwrap_or(raw_word);
-    if !base.is_empty() && base.chars().all(|ch| ch.is_ascii_digit()) && raw_word == base {
-        fallback.to_string()
-    } else if redirector == 0 || redirector == 1 {
-        base.to_string()
-    } else {
+    let move_word = base.len() != raw_word.len();
+    if !base.is_empty() && base.chars().all(|ch| ch.is_ascii_digit()) {
+        return fallback.to_string();
+    }
+    if move_word || redirector > 1 {
         redirector.to_string()
+    } else {
+        base.to_string()
     }
 }
