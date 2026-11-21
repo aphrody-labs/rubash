@@ -1057,6 +1057,17 @@ pub struct Executor {
     /// restore state, not walk currency, and are never recorded
     /// here.
     exec_walk_save_slots: Vec<u32>,
+    /// rubash#4044: depth of SCOPED exec-redirect walks currently
+    /// running (execute_stdio_only_exec_redirect with
+    /// place_persistent=false — `builtin exec`, an exec inside a
+    /// compound redirect bracket, or a nested-context exec routed
+    /// through execute_stdio_only_exec_redirect_scoped). A scoped
+    /// walk restores only the fd TABLE on exit (the wrapper replays
+    /// saved_fd_table), so a kernel close inside it is irreversible
+    /// corruption of the outer scope's descriptors — the same
+    /// table-only-restore invariant close_orphaned_process_fd's
+    /// process-scope gate carries.
+    exec_scoped_redirect_walk_depth: u32,
     /// GNU `command -p` (builtins/command.def CDESC_STDPATH): the
     /// standard path for the re-dispatched command's OWN lookup only.
     /// Set for the duration of the re-dispatch and consulted by the
@@ -1077,6 +1088,9 @@ pub struct Executor {
     /// a condition that unwinds is a failed condition; a typed
     /// `break 1` preempts the pending command like script text).
     debug_action_running: bool,
+    /// GNU trap.c:1286 + builtins/fc.def:540: `fc` suppresses verbose
+    /// echo for DEBUG trap actions while re-executing the edited list.
+    pub(in crate::executor) suppress_debug_trap_verbose: std::cell::Cell<bool>,
     /// rubash#375: parse-once cache for the DEBUG trap action. GNU parses a
     /// trap action once at `trap` invocation (trap.c read_trap_action) and
     /// runs the cached parse per firing; re-tokenizing + re-parsing the same
