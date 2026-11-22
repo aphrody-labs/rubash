@@ -1445,7 +1445,10 @@ impl Executor {
                 // before translating; a literal that names no signal keeps
                 // the historical empty-output behavior.
                 let expanded = self.expand_word(word);
-                if let Some(signal) = crate::builtins::kill::translate_signal(&expanded) {
+                if let Some(signal) = crate::builtins::kill::translate_signal_for_platform(
+                    self.shell_state.platform,
+                    &expanded,
+                ) {
                     self.last_command_substitution_status.set(Some(0));
                     return signal.to_string();
                 }
@@ -2377,6 +2380,7 @@ impl Executor {
             debug_action_running: false,
             suppress_debug_trap_verbose: std::cell::Cell::new(false),
             debug_trap_action_cache: std::cell::RefCell::new(None),
+            runtime_parse_cache: std::cell::RefCell::new(RuntimeParseCache::new()),
             // WP-3: a command-substitution child never inherits the
             // debug session (DE-12: its frames are synthesized in a
             // later work package; stops stay on the owning executor).

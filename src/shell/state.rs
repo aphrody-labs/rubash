@@ -260,6 +260,9 @@ pub struct ShellState {
     pub(crate) history_comment_char_armed: bool,
     /// alias.c aliases.
     pub(crate) aliases: HashMap<String, Alias>,
+    /// Monotonic counter bumped whenever `aliases` is mutated, used to
+    /// key/invalidate the runtime parse cache (`eval` / `trap` / `source`).
+    pub(crate) alias_generation: u64,
     /// Non-counting newline byte offsets for pre-expanded `$(...)` /
     /// `${ ... }` comsub bodies (rubash#3838): the pre-pass expands
     /// comsub bodies at parse time, so runtime `tokenize_comsub_body`
@@ -827,6 +830,8 @@ pub struct ShellState {
     /// own copy is inert. None where there are no process rlimits
     /// (Windows: the emulated table rides the env save/restore).
     pub(crate) fork_saved_process_rlimits: Option<Vec<(char, u64, u64)>>,
+    /// Target platform semantic axis (rubash#2829); defaults to `Platform::host()`.
+    pub(crate) platform: crate::platform::Platform,
 }
 
 /// The shape of the PIPESTATUS variable cell (variables.c:6291
@@ -1143,6 +1148,12 @@ impl ShellState {
     }
 }
 
+impl ShellState {
+    pub(crate) fn bump_alias_generation(&mut self) {
+        self.alias_generation = self.alias_generation.wrapping_add(1);
+    }
+}
+
 impl Clone for ShellState {
     fn clone(&self) -> Self {
         Self {
@@ -1157,6 +1168,7 @@ impl Clone for ShellState {
             forced_interactive: self.forced_interactive,
             history_comment_char_armed: self.history_comment_char_armed,
             aliases: self.aliases.clone(),
+            alias_generation: self.alias_generation,
             comsub_alias_newlines: self.comsub_alias_newlines.clone(),
             functions: self.functions.clone(),
             function_definition_redirects: self.function_definition_redirects.clone(),
@@ -1250,6 +1262,7 @@ impl Clone for ShellState {
             procsub_adhoc_carriers: RefCell::new(Vec::new()),
             fork_saved_process_umask: self.fork_saved_process_umask,
             fork_saved_process_rlimits: self.fork_saved_process_rlimits.clone(),
+            platform: self.platform,
         }
     }
 }
